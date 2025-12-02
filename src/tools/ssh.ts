@@ -2,6 +2,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { SSHService, SSHConnectionConfig, ConnectionStatus, TerminalSession, FileTransferInfo, BatchTransferConfig, TunnelConfig, CommandResult } from './ssh-service.js';
+import { SafetyCheckService, SafetyCheckResult } from '../services/safety-check-service.js';
+import { OutputCacheService } from '../services/output-cache-service.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -10,12 +12,23 @@ import { createHash } from 'crypto';
 export class SshMCP {
   private server: McpServer;
   private sshService: SSHService;
+  private safetyCheckService: SafetyCheckService | null = null;
+  private outputCacheService: OutputCacheService = new OutputCacheService();
   private activeConnections: Map<string, Date> = new Map();
   private backgroundExecutions: Map<string, { interval: NodeJS.Timeout, lastCheck: Date }> = new Map();
+  private pendingConfirmations: Map<string, { command: string, safetyResult: SafetyCheckResult }> = new Map();
 
   constructor() {
     // 初始化SSH服务
     this.sshService = new SSHService();
+
+    // 初始化安全检查服务（如果配置了API密钥）
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (apiKey && process.env.SAFETY_CHECK_ENABLED !== 'false') {
+      const apiBase = process.env.OPENAI_API_BASE;
+      const model = process.env.OPENAI_MODEL || 'gpt-3.5-turbo';
+      this.safetyCheckService = new SafetyCheckService(apiKey, apiBase, model);
+    }
 
     // 初始化MCP服务器
     this.server = new McpServer({
@@ -449,9 +462,11 @@ export class SshMCP {
         command: z.string(),
         cwd: z.string().optional(),
         timeout: z.number().optional(),
-        force: z.boolean().optional()
+        force: z.boolean().optional(),
+        confirmation: z.string().optional(),
+        skipSafetyCheck: z.boolean().optional()
       },
-      async ({ connectionId, command, cwd, timeout, force }) => {
+      async ({ connectionId, command, cwd, timeout, force, confirmation, skipSafetyCheck }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -477,6 +492,96 @@ export class SshMCP {
           
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
+          
+          // 安全检查
+          let securityCheckPassed = false;
+          
+          if (this.safetyCheckService && !skipSafetyCheck && !force) {
+            // 检查是否有待确认的指令
+            const pendingKey = `${connectionId}:${command}`;
+            
+            const pending = this.pendingConfirmations.get(pendingKey);
+            
+            if (pending) {
+              // 验证确认
+              if (pending.safetyResult.level === 'dangerous') {
+                // 危险指令需要完全匹配
+                if (confirmation === command) {
+                  // 确认通过，标记安全检查通过，删除确认状态
+                  securityCheckPassed = true;
+                  this.pendingConfirmations.delete(pendingKey);
+                } else {
+                  this.pendingConfirmations.delete(pendingKey);
+                  return {
+                    content: [{
+                      type: "text",
+                      text: `危险指令确认失败。请重新输入指令。`
+                    }],
+                    isError: true
+                  };
+                }
+              } else if (pending.safetyResult.level === 'moderate') {
+                // 一般指令只需要回复"yes"
+                if (confirmation === 'yes') {
+                  // 确认通过，标记安全检查通过，删除确认状态
+                  securityCheckPassed = true;
+                  this.pendingConfirmations.delete(pendingKey);
+                } else {
+                  this.pendingConfirmations.delete(pendingKey);
+                  return {
+                    content: [{
+                      type: "text",
+                      text: `指令执行已取消。`
+                    }]
+                  };
+                }
+              }
+            } else {
+              // 如果没有待确认状态，进行安全检查
+              const safetyResult = await this.safetyCheckService.checkCommandSafety(command);
+              
+              switch (safetyResult.level) {
+                case 'safe':
+                  // 直接执行，标记安全检查通过
+                  securityCheckPassed = true;
+                  break;
+                  
+                case 'moderate':
+                  // 需要用户确认，存储确认状态
+                  this.pendingConfirmations.set(pendingKey, { command, safetyResult });
+                  return {
+                    content: [{
+                      type: "text",
+                      text: `⚠️ 指令需要确认 ⚠️\n\n指令: "${command}"\n原因: ${safetyResult.reason}\n${safetyResult.suggestedAction ? `建议: ${safetyResult.suggestedAction}\n` : ''}\n请回复"yes"确认执行，或回复"no"取消。`
+                    }]
+                  };
+                  
+                case 'dangerous':
+                  // 需要相同指令确认
+                  this.pendingConfirmations.set(pendingKey, { command, safetyResult });
+                  return {
+                    content: [{
+                      type: "text",
+                      text: `🚨 危险指令检测 🚨\n\n指令: "${command}"\n风险等级: 危险\n原因: ${safetyResult.reason}\n${safetyResult.consequences ? `可能的后果: ${safetyResult.consequences}\n` : ''}\n如果确实需要执行，请再次输入完全相同的指令来确认。`
+                    }]
+                  };
+              }
+            }
+          } else {
+            // 如果跳过安全检查，标记为通过
+            securityCheckPassed = true;
+          }
+          
+          // 只有在安全检查通过后才继续执行命令
+          if (!securityCheckPassed) {
+            return {
+              content: [{
+                type: "text",
+                text: `安全检查未通过，无法执行指令。`
+              }],
+              isError: true
+            };
+          }
           
           // 解析tmux命令
           const tmuxSendKeysRegex = /tmux\s+send-keys\s+(?:-t\s+)?["']?([^"'\s]+)["']?\s+["']?(.+?)["']?\s+(?:Enter|C-m)/i;
@@ -518,7 +623,7 @@ export class SshMCP {
                       const processState = processResult?.stdout?.trim();
                       
                       // 检查是否处于阻塞状态
-                      const isBlocked = 
+                      const isBlocked =
                         // 进程状态检查
                         processState === 'D' || // 不可中断的睡眠状态
                         processState === 'T' || // 已停止
@@ -641,7 +746,7 @@ export class SshMCP {
                   // 方法1: 从后往前找到第一个不同的行
                   if (beforeLines.length > 0 && afterLines.length > 0) {
                     // 找到共同前缀的行数
-                    while (commonPrefix < Math.min(beforeLines.length, afterLines.length) && 
+                    while (commonPrefix < Math.min(beforeLines.length, afterLines.length) &&
                            beforeLines[commonPrefix] === afterLines[commonPrefix]) {
                       commonPrefix++;
                     }
@@ -699,7 +804,7 @@ export class SshMCP {
                     contextOutput += diffOutput.trim();
                     
                     output = `命令已发送到tmux会话 "${sessionName}"，带上下文的输出:\n\n${contextOutput}`;
-                  } 
+                  }
                   // 如果没找到差异但内容确实变了，显示会话最后部分内容（带上下文）
                   else if (beforeCapture.stdout !== afterCapture.stdout) {
                     // 尝试获取最后几次命令和输出
@@ -719,8 +824,8 @@ export class SshMCP {
                     // 如果找到了至少一个命令提示符
                     if (promptPositions.length > 0) {
                       // 取最后3个命令（如果有的话）
-                      const startPosition = promptPositions.length > 3 
-                        ? promptPositions[promptPositions.length - 3] 
+                      const startPosition = promptPositions.length > 3
+                        ? promptPositions[promptPositions.length - 3]
                         : promptPositions[0];
                       
                       const contextOutput = afterLines.slice(startPosition).join('\n');
@@ -858,7 +963,7 @@ export class SshMCP {
                             const processState = processResult?.stdout?.trim();
                             
                             // 检查是否处于阻塞状态
-                            isBlocked = 
+                            isBlocked =
                               // 进程状态检查
                               processState === 'D' || // 不可中断的睡眠状态
                               processState === 'T' || // 已停止
@@ -954,7 +1059,18 @@ export class SshMCP {
           }
           
           // 处理输出长度限制
-          output = this.limitOutputLength(output);
+          const maxLength = parseInt(process.env.MAX_OUTPUT_LENGTH || '10000');
+          if (output.length > maxLength) {
+            const cacheId = this.outputCacheService.cacheOutput(command, output, connectionId);
+            const lastLines = this.outputCacheService.getLastLines(cacheId, 100);
+            
+            return {
+              content: [{
+                type: "text",
+                text: `输出内容过长 (${output.length} 字符)，已缓存。\n\n最后100行:\n${lastLines}\n\n缓存ID: ${cacheId}\n\n请选择操作:\n1. 查看完整输出: getCachedOutput "${cacheId}" "full"\n2. 查看最后N行: getCachedOutput "${cacheId}" "last" 200\n3. 保存到文件: getCachedOutput "${cacheId}" "save" "/path/to/file"`
+              }]
+            };
+          }
           
           return {
             content: [{
@@ -2252,6 +2368,115 @@ export class SshMCP {
   }
 
   /**
+   * 注册缓存管理工具
+   */
+  private registerCacheTools(): void {
+    // 获取缓存输出
+    this.server.tool(
+      "getCachedOutput",
+      "Gets cached output from a previous command execution.",
+      {
+        cacheId: z.string(),
+        option: z.enum(['full', 'last', 'save']).default('full'),
+        lineCount: z.number().optional(),
+        filePath: z.string().optional()
+      },
+      async ({ cacheId, option, lineCount, filePath }) => {
+        try {
+          const cached = this.outputCacheService.getCachedOutput(cacheId);
+          if (!cached) {
+            return {
+              content: [{
+                type: "text",
+                text: `缓存 ${cacheId} 不存在或已过期`
+              }],
+              isError: true
+            };
+          }
+
+          let output: string;
+          switch (option) {
+            case 'full':
+              output = this.outputCacheService.getFullOutput(cacheId) || '';
+              break;
+            case 'last':
+              const lines = lineCount || 100;
+              output = this.outputCacheService.getLastLines(cacheId, lines) || '';
+              break;
+            case 'save':
+              if (!filePath) {
+                return {
+                  content: [{
+                    type: "text",
+                    text: '保存文件时需要提供filePath参数'
+                  }],
+                  isError: true
+                };
+              }
+              const fullOutput = this.outputCacheService.getFullOutput(cacheId) || '';
+              fs.writeFileSync(filePath, fullOutput);
+              return {
+                content: [{
+                  type: "text",
+                  text: `输出已保存到 ${filePath}`
+                }]
+              };
+            default:
+              output = this.outputCacheService.getFullOutput(cacheId) || '';
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: output
+            }]
+          };
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `获取缓存输出时出错: ${error instanceof Error ? error.message : String(error)}`
+            }],
+            isError: true
+          };
+        }
+      }
+    );
+
+    // 列出缓存统计
+    this.server.tool(
+      "getCacheStats",
+      "Gets cache statistics.",
+      {},
+      () => {
+        const stats = this.outputCacheService.getStats();
+        return {
+          content: [{
+            type: "text",
+            text: `缓存统计:\n总条目: ${stats.total}\n活跃: ${stats.active}\n过期: ${stats.expired}`
+          }]
+        };
+      }
+    );
+
+    // 清空缓存
+    this.server.tool(
+      "clearCache",
+      "Clears all cached outputs.",
+      {},
+      () => {
+        this.outputCacheService.clearAll();
+        return {
+          content: [{
+            type: "text",
+            text: '所有缓存已清空'
+          }]
+        };
+      }
+    );
+  }
+
+  /**
    * 关闭所有连接并清理资源
    */
   public async close(): Promise<void> {
@@ -2287,6 +2512,7 @@ export class SshMCP {
       // 清空活跃连接记录
       this.activeConnections.clear();
       this.backgroundExecutions.clear();
+      this.pendingConfirmations.clear();
     } catch (error) {
       console.error('关闭SSH MCP时出错:', error);
       throw error;
