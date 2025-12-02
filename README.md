@@ -141,7 +141,7 @@ npm run build
 ```json
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-mcp-safeguard": {
       "command": "python3",
       "args": [
         "/Users/你的用户名/mcp-ssh-safeguard/bridging_ssh_mcp.py"
@@ -183,7 +183,7 @@ npm run build
 ```json
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-mcp-safeguard": {
       "command": "python3",
       "args": [
         "/home/你的用户名/mcp-ssh-safeguard/bridging_ssh_mcp.py"
