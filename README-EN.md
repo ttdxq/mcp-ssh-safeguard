@@ -99,7 +99,7 @@ Follow these steps to configure MCP based on your operating system:
 ```json
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-mcp-safeguard": {
       "command": "pythonw",
       "args": [
         "C:/Users/YourUsername/mcp-ssh-safeguard/bridging_ssh_mcp.py"
@@ -141,7 +141,7 @@ Follow these steps to configure MCP based on your operating system:
 ```json
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-mcp-safeguard": {
       "command": "python3",
       "args": [
         "/Users/YourUsername/mcp-ssh-safeguard/bridging_ssh_mcp.py"
@@ -183,7 +183,7 @@ Follow these steps to configure MCP based on your operating system:
 ```json
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-mcp-safeguard": {
       "command": "python3",
       "args": [
         "/home/YourUsername/mcp-ssh-safeguard/bridging_ssh_mcp.py"
