@@ -99,7 +99,7 @@ npm run build
 ```json
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-mcp-safeguard": {
       "command": "pythonw",
       "args": [
         "C:/Users/你的用户名/mcp-ssh-safeguard/bridging_ssh_mcp.py"
