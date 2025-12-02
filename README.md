@@ -102,8 +102,22 @@ npm run build
     "ssh-mcp": {
       "command": "pythonw",
       "args": [
-        "C:/Users/你的用户名/mcp-ssh/bridging_ssh_mcp.py"
-      ]
+        "C:/Users/你的用户名/mcp-ssh-safeguard/bridging_ssh_mcp.py"
+      ],
+      "env": {
+        "DATA_PATH": "",
+        "SAVE_HISTORY": "true",
+        "DEFAULT_SSH_PORT": "22",
+        "CONNECTION_TIMEOUT": "10000",
+        "RECONNECT_ATTEMPTS": "3",
+        "PASSWORD_EXPIRY_DAYS": "30",
+        "COMMAND_TIMEOUT": "60000",
+        "OPENAI_API_KEY": "your-api-key-here",
+        "OPENAI_API_BASE": "https://api.openai.com/v1",
+        "OPENAI_MODEL": "gpt-3.5-turbo",
+        "SAFETY_CHECK_ENABLED": "true",
+        "MAX_OUTPUT_LENGTH": "10000"
+      }
     }
   }
 }
@@ -130,8 +144,22 @@ npm run build
     "ssh-mcp": {
       "command": "python3",
       "args": [
-        "/Users/你的用户名/mcp-ssh/bridging_ssh_mcp.py"
-      ]
+        "/Users/你的用户名/mcp-ssh-safeguard/bridging_ssh_mcp.py"
+      ],
+      "env": {
+        "DATA_PATH": "",
+        "SAVE_HISTORY": "true",
+        "DEFAULT_SSH_PORT": "22",
+        "CONNECTION_TIMEOUT": "10000",
+        "RECONNECT_ATTEMPTS": "3",
+        "PASSWORD_EXPIRY_DAYS": "30",
+        "COMMAND_TIMEOUT": "60000",
+        "OPENAI_API_KEY": "your-api-key-here",
+        "OPENAI_API_BASE": "https://api.openai.com/v1",
+        "OPENAI_MODEL": "gpt-3.5-turbo",
+        "SAFETY_CHECK_ENABLED": "true",
+        "MAX_OUTPUT_LENGTH": "10000"
+      }
     }
   }
 }
@@ -158,8 +186,22 @@ npm run build
     "ssh-mcp": {
       "command": "python3",
       "args": [
-        "/home/你的用户名/mcp-ssh/bridging_ssh_mcp.py"
-      ]
+        "/home/你的用户名/mcp-ssh-safeguard/bridging_ssh_mcp.py"
+      ],
+      "env": {
+        "DATA_PATH": "",
+        "SAVE_HISTORY": "true",
+        "DEFAULT_SSH_PORT": "22",
+        "CONNECTION_TIMEOUT": "10000",
+        "RECONNECT_ATTEMPTS": "3",
+        "PASSWORD_EXPIRY_DAYS": "30",
+        "COMMAND_TIMEOUT": "60000",
+        "OPENAI_API_KEY": "your-api-key-here",
+        "OPENAI_API_BASE": "https://api.openai.com/v1",
+        "OPENAI_MODEL": "gpt-3.5-turbo",
+        "SAFETY_CHECK_ENABLED": "true",
+        "MAX_OUTPUT_LENGTH": "10000"
+      }
     }
   }
 }
