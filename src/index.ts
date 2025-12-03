@@ -7,6 +7,9 @@ import { ProcessManager } from './process-manager.js';
 // 加载环境变量
 config();
 
+// 确保 stdin 保持活跃状态
+process.stdin.resume();
+
 // 主函数
 async function main() {
   // 初始化进程管理器
@@ -21,13 +24,13 @@ async function main() {
 
   // 处理进程退出
   process.on('SIGINT', async () => {
-    console.log('正在关闭SSH MCP服务...');
+    console.error('正在关闭SSH MCP服务...');
     await sshMCP.close();
     process.exit(0);
   });
 
   process.on('SIGTERM', async () => {
-    console.log('正在关闭SSH MCP服务...');
+    console.error('正在关闭SSH MCP服务...');
     await sshMCP.close();
     process.exit(0);
   });
@@ -43,11 +46,16 @@ async function main() {
     // 不退出进程，保持SSH服务运行
   });
 
-  console.log('SSH MCP服务已启动');
+  // 监听 stdin 的结束事件
+  process.stdin.on('end', () => {
+    console.error('stdin closed, keeping process alive');
+  });
+
+  console.error('SSH MCP服务已启动');
 }
 
 // 启动应用
 main().catch(error => {
   console.error('启动失败:', error);
   process.exit(1);
-}); 
+});

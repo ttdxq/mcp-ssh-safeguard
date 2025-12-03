@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "mcp": "node dist/index.js",
     "dev": "ts-node-dev --respawn src/index.ts",
     "test": "jest",
     "register": "cursor tool register ssh-mcp -p dist/index.js",

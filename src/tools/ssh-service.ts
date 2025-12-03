@@ -469,7 +469,7 @@ export class SSHService {
         // 尝试重连
         await this.connect(config);
         // 重连成功
-        console.log(`成功重新连接到 ${config.host}`);
+        console.error(`成功重新连接到 ${config.host}`);
       } catch (error) {
         // 重连失败
         console.error(`重连尝试 ${attempts}/${reconnectTries} 失败:`, error);
@@ -1722,7 +1722,7 @@ export class SSHService {
       }
     }
     
-    console.log(`已清理完成的文件传输记录，当前剩余: ${this.fileTransfers.size}`);
+    console.error(`已清理完成的文件传输记录，当前剩余: ${this.fileTransfers.size}`);
   }
   
   // 清理不活跃的资源
@@ -1745,7 +1745,7 @@ export class SSHService {
       // 未来可以添加活动时间跟踪
     }
     
-    console.log(`已清理不活跃资源，当前终端会话: ${this.terminalSessions.size}, 隧道: ${this.tunnels.size}`);
+    console.error(`已清理不活跃资源，当前终端会话: ${this.terminalSessions.size}, 隧道: ${this.tunnels.size}`);
   }
   
   // 关闭服务

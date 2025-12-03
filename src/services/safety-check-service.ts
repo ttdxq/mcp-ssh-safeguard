@@ -45,7 +45,7 @@ export class SafetyCheckService {
     } catch (error) {
       console.error('AI安全检查失败:', error);
       // AI检查失败时，使用快速安全检查作为降级方案
-      console.log('使用快速安全检查作为降级方案');
+      console.error('使用快速安全检查作为降级方案');
       const quickResult = this.quickCheck(command);
       this.cacheResult(command, quickResult);
       return quickResult;
