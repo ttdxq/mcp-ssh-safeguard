@@ -68,10 +68,22 @@ export class SafetyCheckService {
   "consequences": "可能的后果（危险指令必填）"
 }
 
-安全级别定义：
-- safe: 只读操作，不会修改系统（如：ls, cat, grep, pwd, whoami）
-- moderate: 会修改文件或系统配置，但风险可控（如：touch, mkdir, apt-get install）
-- dangerous: 可能导致数据丢失或系统损坏（如：rm -rf, dd, fdisk）
+安全级别定义（请严格遵守）：
+- safe:
+    1. **常规信息查询与读取** (ls, cat, grep, whoami)
+    2. **标准的环境配置与软件安装** (包含 sudo apt/yum/dnf install, pip install, npm install)
+    3. **正常的权限授予** (如为脚本赋予执行权限 chmod +x script.sh, sudo chown user:group file)
+    4. **常规文件操作** (mkdir, cp, mv, touch, echo，包含使用 sudo 操作非系统核心文件)
+    5. **服务管理** (sudo systemctl start/restart/enable, service nginx reload)
+- moderate:
+    1. **修改核心系统配置文件** (直接编辑 /etc/passwd, /etc/ssh/sshd_config 等敏感文件)
+    2. **不仅修改权限且造成安全隐患** (如 chmod 777 /, chmod -R 777 /var/www)
+    3. **涉及网络架构的重大变更** (iptables flush, 修改网卡配置)
+    4. **资源密集型操作** (可能导致短时间卡顿的构建或压缩任务)
+- dangerous:
+    1. **明确的破坏性操作** (rm -rf / 或删除关键系统目录, 格式化磁盘 mkfs)
+    2. **恶意行为特征** (反弹Shell, 写入定时任务下载未知脚本, 禁用防火墙)
+    3. **不可逆的系统重置**
 
 请只返回JSON，不要其他解释。`;
 
