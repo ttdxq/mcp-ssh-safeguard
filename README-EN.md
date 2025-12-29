@@ -71,8 +71,8 @@ Through simple natural language instructions, AI can help you complete all of th
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/shuakami/mcp-ssh.git
-cd mcp-ssh
+git clone https://github.com/ttdxq/mcp-ssh-safeguard.git
+cd mcp-ssh-safeguard
 npm install
 npm run build
 ```
@@ -116,7 +116,7 @@ Follow these steps to configure MCP based on your operating system:
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
         "SAFETY_CHECK_ENABLED": "true",
-        "MAX_OUTPUT_LENGTH": "10000"
+        "MAX_OUTPUT_LENGTH": "3000"
       }
     }
   }
@@ -158,7 +158,7 @@ Follow these steps to configure MCP based on your operating system:
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
         "SAFETY_CHECK_ENABLED": "true",
-        "MAX_OUTPUT_LENGTH": "10000"
+        "MAX_OUTPUT_LENGTH": "3000"
       }
     }
   }
@@ -200,7 +200,7 @@ Follow these steps to configure MCP based on your operating system:
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
         "SAFETY_CHECK_ENABLED": "true",
-        "MAX_OUTPUT_LENGTH": "10000"
+        "MAX_OUTPUT_LENGTH": "3000"
       }
     }
   }
@@ -395,4 +395,4 @@ You can also run this tool inside a Docker container. This is the recommended wa
 
     ```bash
     docker run -it -v mcp-ssh-data:/root/.mcp-ssh -v %USERPROFILE%\.ssh:/root/.ssh mcp-ssh
-    ``` 
+    ```

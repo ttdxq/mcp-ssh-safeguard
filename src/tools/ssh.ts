@@ -456,17 +456,15 @@ export class SshMCP {
     // 执行命令
     this.server.tool(
       "executeCommand",
-      "Executes a command on a remote server via SSH.",
+      "IMPORTANT: Before executing any command, ALWAYS use 'listConnections' first to verify the connection exists and get the correct connectionId. If you're unsure about the connection state, use 'getConnection' to check details. Executes a command on a remote server via SSH. All commands go through mandatory safety checks.",
       {
-        connectionId: z.string(),
-        command: z.string(),
-        cwd: z.string().optional(),
-        timeout: z.number().optional(),
-        force: z.boolean().optional(),
-        confirmation: z.string().optional(),
-        skipSafetyCheck: z.boolean().optional()
+        connectionId: z.string().describe("The connection ID. Use 'listConnections' to find available connections before executing commands."),
+        command: z.string().describe("The command to execute on the remote server"),
+        cwd: z.string().optional().describe("Working directory for command execution"),
+        timeout: z.number().optional().describe("Command execution timeout in milliseconds"),
+        confirmation: z.string().optional().describe("Confirmation string (required when prompted by safety check)")
       },
-      async ({ connectionId, command, cwd, timeout, force, confirmation, skipSafetyCheck }) => {
+      async ({ connectionId, command, cwd, timeout, confirmation }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -496,7 +494,7 @@ export class SshMCP {
           // 安全检查
           let securityCheckPassed = false;
           
-          if (this.safetyCheckService && !skipSafetyCheck && !force) {
+          if (this.safetyCheckService) {
             // 检查是否有待确认的指令
             const pendingKey = `${connectionId}:${command}`;
             
@@ -600,7 +598,7 @@ export class SshMCP {
               sessionName = match[1];
               
               // 如果不是强制执行,才进行阻塞检测
-              if (!force) {
+              if (true) {
                 try {
                   // 捕获当前会话内容
                   const checkResult: CommandResult = await this.sshService.executeCommand(
@@ -666,7 +664,7 @@ export class SshMCP {
                                   `   - 等待任务完成（执行 sleep <seconds> 命令进行等待）\n` +
                                   `   - 使用 Ctrl+C (tmux send-keys -t ${sessionName} C-c)\n` +
                                   `   - 使用 kill -TERM ${panePid} 终止进程\n\n` +
-                                  `为避免命令冲突, 本次操作已取消。如果确定要强制执行,请添加 force: true 参数。`
+                                  `为避免命令冲突, 本次操作已取消。请先解决阻塞问题后再试。`
                           }],
                           isError: true
                         };
@@ -1059,7 +1057,7 @@ export class SshMCP {
           }
           
           // 处理输出长度限制
-          const maxLength = parseInt(process.env.MAX_OUTPUT_LENGTH || '10000');
+          const maxLength = parseInt(process.env.MAX_OUTPUT_LENGTH || '3000');
           if (output.length > maxLength) {
             const cacheId = this.outputCacheService.cacheOutput(command, output, connectionId);
             const lastLines = this.outputCacheService.getLastLines(cacheId, 100);
@@ -2522,7 +2520,7 @@ export class SshMCP {
   /**
    * 处理长文本输出，超过限制时截取前后部分
    */
-  private limitOutputLength(text: string, maxLength: number = 10000, targetLength: number = 6000): string {
+  private limitOutputLength(text: string, maxLength: number = 3000, targetLength: number = 1500): string {
     if (text.length <= maxLength) {
       return text;
     }
