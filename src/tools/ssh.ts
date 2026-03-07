@@ -214,10 +214,33 @@ export class SshMCP {
             reconnectTries: parseInt(process.env.RECONNECT_ATTEMPTS || '3'),
             reconnectDelay: 5000
           };
-          
+
           // 如果提供了私钥，优先使用私钥认证
           if (params.privateKey) {
-            config.privateKey = params.privateKey;
+            // 检查是否是私钥内容（以 -----BEGIN 开头）还是文件路径
+            if (params.privateKey.trim().startsWith('-----BEGIN')) {
+              // 直接使用私钥内容
+              config.privateKey = params.privateKey;
+            } else {
+              // 视为文件路径，读取私钥内容
+              let keyPath = params.privateKey;
+              // 展开 ~ 为用户主目录
+              if (keyPath.startsWith('~')) {
+                keyPath = keyPath.replace(/^~/, os.homedir());
+              }
+              // 检查文件是否存在
+              if (!fs.existsSync(keyPath)) {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `连接失败: 私钥文件不存在: ${keyPath}`
+                  }],
+                  isError: true
+                };
+              }
+              // 读取私钥文件内容
+              config.privateKey = fs.readFileSync(keyPath, 'utf8');
+            }
             config.passphrase = params.passphrase;
           }
           
