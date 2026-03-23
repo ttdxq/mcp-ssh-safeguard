@@ -115,6 +115,8 @@ npm run build
         "OPENAI_API_KEY": "your-api-key-here",
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
+        "OPENAI_TIMEOUT": "30000",
+        "OPENAI_THINKING_TYPE": "disabled",
         "SAFETY_CHECK_ENABLED": "true",
         "MAX_OUTPUT_LENGTH": "3000"
       }
@@ -122,6 +124,14 @@ npm run build
   }
 }
 ```
+
+说明：运行时现在优先读取 `DATA_PATH`，旧的 `SSH_DATA_PATH` 仅作为兼容别名。
+
+说明：Docker 模式默认不会持久化保存密码；只有在明确设置 `ALLOW_INSECURE_DOCKER_CREDENTIALS=true` 时，才会恢复旧的明文保存行为。
+
+说明：AI 安全检查支持通过 `OPENAI_TIMEOUT` 调整模型请求超时，并通过 `OPENAI_THINKING_TYPE=disabled|enabled|auto` 控制供应商的思考能力开关。
+
+说明：兼容 OpenAI 风格和方舟风格变量名；例如 `OPENAI_API_KEY`/`ARK_API_KEY`、`OPENAI_API_BASE`/`ARK_API_BASE`、`OPENAI_MODEL`/`ARK_MODEL` 都可用于初始化 AI 安全检查。
 
 > ⚠️ **请注意**:
 > - 将 `你的用户名` 替换为你的 Windows 用户名
@@ -380,7 +390,7 @@ If this project helps you, please give it a Star ⭐️ (｡♥‿♥｡)
 
 2.  **运行 Docker 容器 (附带数据持久化):**
 
-    为了确保您的连接配置和凭证在容器重启后不丢失，我们强烈建议您使用 Docker 数据卷 (Volume)。
+    为了确保您的连接配置在容器重启后不丢失，我们强烈建议您使用 Docker 数据卷 (Volume)。默认不会持久化保存密码。
 
     ```bash
     # (首次运行前) 创建一个数据卷来存储数据

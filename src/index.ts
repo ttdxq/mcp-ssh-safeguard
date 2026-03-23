@@ -10,6 +10,25 @@ config();
 // 确保 stdin 保持活跃状态
 process.stdin.resume();
 
+let shutdownPromise: Promise<void> | null = null;
+
+async function shutdown(sshMCP: SshMCP, processManager: ProcessManager, exitCode: number, reason: string): Promise<void> {
+  if (!shutdownPromise) {
+    shutdownPromise = (async () => {
+      console.error(reason);
+      try {
+        await sshMCP.close();
+      } catch (error) {
+        console.error('关闭SSH MCP服务时出错:', error);
+      }
+      processManager.cleanup();
+    })();
+  }
+
+  await shutdownPromise;
+  process.exit(exitCode);
+}
+
 // 主函数
 async function main() {
   // 初始化进程管理器
@@ -24,26 +43,21 @@ async function main() {
 
   // 处理进程退出
   process.on('SIGINT', async () => {
-    console.error('正在关闭SSH MCP服务...');
-    await sshMCP.close();
-    process.exit(0);
+    await shutdown(sshMCP, processManager, 0, '正在关闭SSH MCP服务...');
   });
 
   process.on('SIGTERM', async () => {
-    console.error('正在关闭SSH MCP服务...');
-    await sshMCP.close();
-    process.exit(0);
+    await shutdown(sshMCP, processManager, 0, '正在关闭SSH MCP服务...');
   });
 
-  // 处理未捕获的异常，避免崩溃
-  process.on('uncaughtException', (err) => {
+  process.on('uncaughtException', async (err) => {
     console.error('未捕获的异常:', err);
-    // 不退出进程，保持SSH服务运行
+    await shutdown(sshMCP, processManager, 1, '检测到致命异常，正在安全关闭SSH MCP服务...');
   });
 
-  process.on('unhandledRejection', (reason, promise) => {
+  process.on('unhandledRejection', async (reason) => {
     console.error('未处理的Promise拒绝:', reason);
-    // 不退出进程，保持SSH服务运行
+    await shutdown(sshMCP, processManager, 1, '检测到未处理的Promise拒绝，正在安全关闭SSH MCP服务...');
   });
 
   // 监听 stdin 的结束事件

@@ -115,6 +115,8 @@ Follow these steps to configure MCP based on your operating system:
         "OPENAI_API_KEY": "your-api-key-here",
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
+        "OPENAI_TIMEOUT": "30000",
+        "OPENAI_THINKING_TYPE": "disabled",
         "SAFETY_CHECK_ENABLED": "true",
         "MAX_OUTPUT_LENGTH": "3000"
       }
@@ -122,6 +124,14 @@ Follow these steps to configure MCP based on your operating system:
   }
 }
 ```
+
+Note: the runtime now reads `DATA_PATH` first. `SSH_DATA_PATH` is kept only as a legacy fallback.
+
+Note: Docker mode no longer persists remembered passwords by default. The old plaintext behavior is only restored when `ALLOW_INSECURE_DOCKER_CREDENTIALS=true` is set explicitly.
+
+Note: AI safety checks now support `OPENAI_TIMEOUT` for provider-specific request timeouts and `OPENAI_THINKING_TYPE=disabled|enabled|auto` for compatible thinking controls.
+
+Note: the safety client accepts both OpenAI-style and Ark-style variable names, such as `OPENAI_API_KEY`/`ARK_API_KEY`, `OPENAI_API_BASE`/`ARK_API_BASE`, and `OPENAI_MODEL`/`ARK_MODEL`.
 
 > ⚠️ **Please note**:
 > - Replace `YourUsername` with your Windows username

@@ -1,4 +1,7 @@
 import OpenAI from 'openai';
+import type { ChatCompletionCreateParamsNonStreaming } from 'openai/resources/chat/completions';
+
+type ThinkingMode = 'disabled' | 'enabled' | 'auto';
 
 export interface SafetyCheckResult {
   level: 'safe' | 'moderate' | 'dangerous';
@@ -17,14 +20,22 @@ export class SafetyCheckService {
   private cache: Map<string, CachedSafetyResult> = new Map();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
   private readonly MAX_CACHE_SIZE = 100;
+  private readonly thinkingMode: ThinkingMode;
 
-  constructor(apiKey: string, apiBase?: string, private model: string = 'gpt-3.5-turbo') {
+  constructor(
+    apiKey: string,
+    apiBase?: string,
+    private model: string = 'gpt-3.5-turbo',
+    timeout: number = 30000,
+    thinkingMode: ThinkingMode = 'disabled'
+  ) {
     this.openai = new OpenAI({
       apiKey,
       baseURL: apiBase || 'https://api.openai.com/v1',
-      timeout: 30000, // [优化] 延长至30秒，防止复杂Prompt分析超时
+      timeout,
       maxRetries: 1,
     });
+    this.thinkingMode = thinkingMode;
   }
 
   /**
@@ -96,7 +107,7 @@ export class SafetyCheckService {
 
 请只返回JSON，不要其他解释。`;
 
-    const response = await this.openai.chat.completions.create({
+    const requestBody: ChatCompletionCreateParamsNonStreaming = {
       model: this.model,
       messages: [
         {
@@ -110,6 +121,15 @@ export class SafetyCheckService {
       ],
       temperature: 0.1, // 低温度保证确定性
       max_tokens: 300,
+    };
+
+    const response = await this.openai.chat.completions.create(requestBody, {
+      body: {
+        ...requestBody,
+        thinking: {
+          type: this.thinkingMode
+        }
+      }
     });
 
     const content = response.choices[0]?.message?.content;

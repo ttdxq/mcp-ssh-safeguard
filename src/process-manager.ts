@@ -36,7 +36,7 @@ export class ProcessManager {
     process.on("exit", () => this.cleanup());
   }
 
-  private cleanup(): void {
+  public cleanup(): void {
     try {
       if (fs.existsSync(LOCK_FILE)) {
         const lockData = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));

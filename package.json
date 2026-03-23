@@ -3,13 +3,14 @@
   "version": "1.0.0",
   "description": "SSH连接管理的MCP工具，支持自动记忆凭证、服务器列表和后台操作",
   "main": "dist/index.js",
+  "packageManager": "npm@10",
   "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "mcp": "node dist/index.js",
     "dev": "ts-node-dev --respawn src/index.ts",
-    "test": "jest",
+    "test": "npm run build && node --test",
     "register": "cursor tool register ssh-mcp -p dist/index.js",
     "unregister": "cursor tool unregister ssh-mcp"
   },

@@ -9,6 +9,16 @@ import * as path from 'path';
 import * as os from 'os';
 import { createHash } from 'crypto';
 
+type OperationRiskType = 'command' | 'background_command' | 'file_upload' | 'file_download' | 'batch_file_upload' | 'batch_file_download' | 'tunnel_create' | 'terminal_write';
+
+interface OperationPolicyAssessment {
+  allowed: boolean;
+  response?: {
+    content: Array<{ type: 'text'; text: string }>;
+    isError?: boolean;
+  };
+}
+
 export class SshMCP {
   private server: McpServer;
   private sshService: SSHService;
@@ -23,11 +33,16 @@ export class SshMCP {
     this.sshService = new SSHService();
 
     // 初始化安全检查服务（如果配置了API密钥）
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.OPENAI_API_KEY || process.env.ARK_API_KEY;
     if (apiKey && process.env.SAFETY_CHECK_ENABLED !== 'false') {
-      const apiBase = process.env.OPENAI_API_BASE;
-      const model = process.env.OPENAI_MODEL || 'gpt-3.5-turbo';
-      this.safetyCheckService = new SafetyCheckService(apiKey, apiBase, model);
+      const apiBase = process.env.OPENAI_API_BASE || process.env.ARK_API_BASE;
+      const model = process.env.OPENAI_MODEL || process.env.ARK_MODEL || 'gpt-3.5-turbo';
+      const timeout = parseInt(process.env.OPENAI_TIMEOUT || process.env.ARK_TIMEOUT || '30000', 10);
+      const configuredThinkingType = process.env.OPENAI_THINKING_TYPE || process.env.ARK_THINKING_TYPE;
+      const thinkingType = configuredThinkingType === 'enabled' || configuredThinkingType === 'auto'
+        ? configuredThinkingType
+        : 'disabled';
+      this.safetyCheckService = new SafetyCheckService(apiKey, apiBase, model, timeout, thinkingType);
     }
 
     // 初始化MCP服务器
@@ -61,6 +76,8 @@ export class SshMCP {
     
     // 会话管理
     this.registerSessionTools();
+
+    this.registerCacheTools();
     
     // 终端交互
     this.registerTerminalTools();
@@ -180,6 +197,170 @@ export class SshMCP {
       this.backgroundExecutions.delete(connectionId);
     }
   }
+
+  private createPendingConfirmationKey(connectionId: string, operationType: OperationRiskType, command: string): string {
+    return `${operationType}:${connectionId}:${command}`;
+  }
+
+  private isFailClosedAllowedCommand(command: string): boolean {
+    const normalizedCommand = command.trim().toLowerCase();
+    if (!normalizedCommand || normalizedCommand.includes('&&') || normalizedCommand.includes(';') || normalizedCommand.includes('|')) {
+      return false;
+    }
+
+    const readOnlyPatterns = [
+      /^pwd$/,
+      /^whoami$/,
+      /^hostname$/,
+      /^uname(?:\s+-[a-z]+)*$/,
+      /^id$/,
+      /^date$/,
+      /^ls(?:\s+[-\w./~]+)*$/,
+      /^cat\s+[-\w./~]+$/,
+      /^head\s+[-\w./~\s]+$/,
+      /^tail\s+[-\w./~\s]+$/,
+      /^df(?:\s+-[a-z]+)*$/,
+      /^free(?:\s+-[a-z]+)*$/,
+      /^ps(?:\s+[-\w]+)*$/
+    ];
+
+    return readOnlyPatterns.some((pattern) => pattern.test(normalizedCommand));
+  }
+
+  private buildPendingConfirmationResponse(operationSummary: string, safetyResult: SafetyCheckResult): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
+    if (safetyResult.level === 'moderate') {
+      return {
+        content: [{
+          type: 'text',
+          text: `⚠️ 操作需要确认 ⚠️\n\n操作: "${operationSummary}"\n原因: ${safetyResult.reason}\n${safetyResult.suggestedAction ? `建议: ${safetyResult.suggestedAction}\n` : ''}\n请回复"yes"确认执行，或回复"no"取消。`
+        }]
+      };
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: `🚨 危险操作检测 🚨\n\n操作: "${operationSummary}"\n风险等级: 危险\n原因: ${safetyResult.reason}\n${safetyResult.consequences ? `可能的后果: ${safetyResult.consequences}\n` : ''}\n如果确实需要执行，请再次输入完全相同的内容来确认。`
+      }]
+    };
+  }
+
+  private buildFailClosedResponse(operationSummary: string, operationType: OperationRiskType): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
+    const operationLabelMap: Record<OperationRiskType, string> = {
+      command: '指令',
+      background_command: '后台指令',
+      file_upload: '文件上传',
+      file_download: '文件下载',
+      batch_file_upload: '批量文件上传',
+      batch_file_download: '批量文件下载',
+      tunnel_create: '隧道创建',
+      terminal_write: '终端写入'
+    };
+    const operationLabel = operationLabelMap[operationType];
+    return {
+      content: [{
+        type: 'text',
+        text: `🚨 高风险操作已拒绝 🚨\n\n${operationLabel}: "${operationSummary}"\n原因: AI 安全检查当前不可用，系统已进入默认拒绝模式。仅允许极小范围的只读命令通过，其他操作必须在安全检查恢复后再执行。`
+      }],
+      isError: true
+    };
+  }
+
+  private async assessOperationPolicy(params: {
+    connectionId: string;
+    command: string;
+    confirmation?: string;
+    operationType: OperationRiskType;
+    operationSummary?: string;
+  }): Promise<OperationPolicyAssessment> {
+    const { connectionId, command, confirmation, operationType, operationSummary = command } = params;
+    const pendingKey = this.createPendingConfirmationKey(connectionId, operationType, command);
+    const pending = this.pendingConfirmations.get(pendingKey);
+
+    if (confirmation && !pending) {
+      return {
+        allowed: false,
+        response: {
+          content: [{
+            type: 'text',
+            text: `🚨 高风险确认请求已拒绝 🚨\n\n操作: "${operationSummary}"\n原因: 当前操作没有待确认记录，或此前未获得执行同意。系统已将本次确认内容视为高风险输入并拒绝执行。`
+          }],
+          isError: true
+        }
+      };
+    }
+
+    if (pending) {
+      if (pending.safetyResult.level === 'dangerous') {
+        if (confirmation === command) {
+          this.pendingConfirmations.delete(pendingKey);
+          return { allowed: true };
+        }
+
+        this.pendingConfirmations.delete(pendingKey);
+        return {
+          allowed: false,
+          response: {
+            content: [{ type: 'text', text: '危险操作确认失败。请重新输入确认内容。' }],
+            isError: true
+          }
+        };
+      }
+
+      if (confirmation === 'yes') {
+        this.pendingConfirmations.delete(pendingKey);
+        return { allowed: true };
+      }
+
+      this.pendingConfirmations.delete(pendingKey);
+      return {
+        allowed: false,
+        response: {
+          content: [{ type: 'text', text: '指令执行已取消。' }]
+        }
+      };
+    }
+
+    if (!this.safetyCheckService) {
+      if (operationType === 'command' && this.isFailClosedAllowedCommand(command)) {
+        return { allowed: true };
+      }
+
+      return {
+        allowed: false,
+        response: this.buildFailClosedResponse(operationSummary, operationType)
+      };
+    }
+
+    let safetyResult = await this.safetyCheckService.checkCommandSafety(command);
+
+    if (operationType === 'background_command') {
+      if (safetyResult.level === 'safe') {
+        safetyResult = {
+          ...safetyResult,
+          level: 'moderate',
+          reason: '后台持续执行会放大指令影响范围，即使原始指令较安全也需要人工确认。',
+          suggestedAction: '确认该命令适合长期重复执行，并检查执行频率与影响范围。'
+        };
+      } else if (safetyResult.level === 'moderate') {
+        safetyResult = {
+          ...safetyResult,
+          reason: `${safetyResult.reason} 后台持续执行会进一步放大风险。`,
+          suggestedAction: safetyResult.suggestedAction || '仅在明确需要时执行，并确保频率与持续时间受控。'
+        };
+      }
+    }
+
+    if (safetyResult.level === 'safe') {
+      return { allowed: true };
+    }
+
+    this.pendingConfirmations.set(pendingKey, { command, safetyResult });
+    return {
+      allowed: false,
+      response: this.buildPendingConfirmationResponse(operationSummary, safetyResult)
+    };
+  }
   
   /**
    * 注册连接管理工具
@@ -255,10 +436,14 @@ export class SshMCP {
           // 记录活跃连接
           this.activeConnections.set(connection.id, new Date());
           
+          const credentialNotice = params.rememberPassword && !this.sshService.canPersistCredentials()
+            ? '\n\n提示: 当前在 Docker 模式下运行，默认不会持久化保存密码。如需恢复旧行为，请设置 ALLOW_INSECURE_DOCKER_CREDENTIALS=true。'
+            : '';
+
           return {
             content: [{
               type: "text",
-              text: `连接成功!\n\n${this.formatConnectionInfo(connection)}`
+              text: `连接成功!\n\n${this.formatConnectionInfo(connection)}${credentialNotice}`
             }]
           };
         } catch (error) {
@@ -514,83 +699,15 @@ export class SshMCP {
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
           
-          // 安全检查
-          let securityCheckPassed = false;
-          
-          if (this.safetyCheckService) {
-            // 检查是否有待确认的指令
-            const pendingKey = `${connectionId}:${command}`;
-            
-            const pending = this.pendingConfirmations.get(pendingKey);
-            
-            if (pending) {
-              // 验证确认
-              if (pending.safetyResult.level === 'dangerous') {
-                // 危险指令需要完全匹配
-                if (confirmation === command) {
-                  // 确认通过，标记安全检查通过，删除确认状态
-                  securityCheckPassed = true;
-                  this.pendingConfirmations.delete(pendingKey);
-                } else {
-                  this.pendingConfirmations.delete(pendingKey);
-                  return {
-                    content: [{
-                      type: "text",
-                      text: `危险指令确认失败。请重新输入指令。`
-                    }],
-                    isError: true
-                  };
-                }
-              } else if (pending.safetyResult.level === 'moderate') {
-                // 一般指令只需要回复"yes"
-                if (confirmation === 'yes') {
-                  // 确认通过，标记安全检查通过，删除确认状态
-                  securityCheckPassed = true;
-                  this.pendingConfirmations.delete(pendingKey);
-                } else {
-                  this.pendingConfirmations.delete(pendingKey);
-                  return {
-                    content: [{
-                      type: "text",
-                      text: `指令执行已取消。`
-                    }]
-                  };
-                }
-              }
-            } else {
-              // 如果没有待确认状态，进行安全检查
-              const safetyResult = await this.safetyCheckService.checkCommandSafety(command);
-              
-              switch (safetyResult.level) {
-                case 'safe':
-                  // 直接执行，标记安全检查通过
-                  securityCheckPassed = true;
-                  break;
-                  
-                case 'moderate':
-                  // 需要用户确认，存储确认状态
-                  this.pendingConfirmations.set(pendingKey, { command, safetyResult });
-                  return {
-                    content: [{
-                      type: "text",
-                      text: `⚠️ 指令需要确认 ⚠️\n\n指令: "${command}"\n原因: ${safetyResult.reason}\n${safetyResult.suggestedAction ? `建议: ${safetyResult.suggestedAction}\n` : ''}\n请回复"yes"确认执行，或回复"no"取消。`
-                    }]
-                  };
-                  
-                case 'dangerous':
-                  // 需要相同指令确认
-                  this.pendingConfirmations.set(pendingKey, { command, safetyResult });
-                  return {
-                    content: [{
-                      type: "text",
-                      text: `🚨 危险指令检测 🚨\n\n指令: "${command}"\n风险等级: 危险\n原因: ${safetyResult.reason}\n${safetyResult.consequences ? `可能的后果: ${safetyResult.consequences}\n` : ''}\n如果确实需要执行，请再次输入完全相同的指令来确认。`
-                    }]
-                  };
-              }
-            }
-          } else {
-            // 如果跳过安全检查，标记为通过
-            securityCheckPassed = true;
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId,
+            command,
+            confirmation,
+            operationType: 'command'
+          });
+          const securityCheckPassed = policyAssessment.allowed;
+          if (policyAssessment.response) {
+            return policyAssessment.response;
           }
           
           // 只有在安全检查通过后才继续执行命令
@@ -619,6 +736,12 @@ export class SshMCP {
             const match = command.match(tmuxSendKeysRegex);
             if (match) {
               sessionName = match[1];
+
+              beforeCapture = await this.sshService.executeCommand(
+                connectionId,
+                `tmux capture-pane -p -t ${sessionName}`,
+                { cwd, timeout: 5000 }
+              );
               
               // 如果不是强制执行,才进行阻塞检测
               if (true) {
@@ -719,6 +842,8 @@ export class SshMCP {
           const currentDir = connection.currentDirectory || '~';
           const promptPrefix = `[${connection.config.username}@${connection.config.host}`;
           
+          const hasCommandOutput = Boolean(result.stdout || result.stderr);
+
           if (result.stdout) {
             output += result.stdout;
           }
@@ -737,7 +862,7 @@ export class SshMCP {
           output += `\n${promptPrefix} ${currentDir}]$ `;
           
           // 如果是tmux命令且命令执行成功，增强输出信息
-          if (isTmuxCommand && result.code === 0 && (!output || output.trim() === '')) {
+          if (isTmuxCommand && result.code === 0 && !hasCommandOutput) {
             try {
               // 识别命令类型并处理
               
@@ -1119,9 +1244,10 @@ export class SshMCP {
         connectionId: z.string(),
         command: z.string(),
         interval: z.number().optional(),
-        cwd: z.string().optional()
+        cwd: z.string().optional(),
+        confirmation: z.string().optional().describe("Confirmation string required for commands that need explicit approval")
       },
-      async ({ connectionId, command, interval = 10000, cwd }) => {
+      async ({ connectionId, command, interval = 10000, cwd, confirmation }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -1152,7 +1278,26 @@ export class SshMCP {
           
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
-          
+
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId,
+            command,
+            confirmation,
+            operationType: 'background_command'
+          });
+          if (policyAssessment.response) {
+            return policyAssessment.response;
+          }
+          if (!policyAssessment.allowed) {
+            return {
+              content: [{
+                type: "text",
+                text: `安全策略未允许后台执行该命令。`
+              }],
+              isError: true
+            };
+          }
+           
           // 先执行一次命令
           await this.sshService.executeCommand(connectionId, command, { cwd });
           
@@ -1320,9 +1465,10 @@ export class SshMCP {
       {
         connectionId: z.string(),
         localPath: z.string(),
-        remotePath: z.string()
+        remotePath: z.string(),
+        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
       },
-      async ({ connectionId, localPath, remotePath }) => {
+      async ({ connectionId, localPath, remotePath, confirmation }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -1359,7 +1505,19 @@ export class SshMCP {
           
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
-          
+
+          const operationSummary = `upload local file ${localPath} to remote path ${remotePath}`;
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId,
+            command: operationSummary,
+            confirmation,
+            operationType: 'file_upload',
+            operationSummary
+          });
+          if (policyAssessment.response) {
+            return policyAssessment.response;
+          }
+           
           // 上传文件并获取传输ID
           const transferInfo = await this.sshService.uploadFile(connectionId, localPath, remotePath);
           const transferId = transferInfo.id;
@@ -1424,9 +1582,10 @@ export class SshMCP {
       {
         connectionId: z.string(),
         remotePath: z.string(),
-        localPath: z.string().optional()
+        localPath: z.string().optional(),
+        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
       },
-      async ({ connectionId, remotePath, localPath }) => {
+      async ({ connectionId, remotePath, localPath, confirmation }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -1465,7 +1624,19 @@ export class SshMCP {
           
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
-          
+
+          const operationSummary = `download remote file ${remotePath} to local path ${savePath}`;
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId,
+            command: operationSummary,
+            confirmation,
+            operationType: 'file_download',
+            operationSummary
+          });
+          if (policyAssessment.response) {
+            return policyAssessment.response;
+          }
+           
           // 下载文件并获取传输ID
           const transferInfo = await this.sshService.downloadFile(connectionId, remotePath, savePath);
           const transferId = transferInfo.id;
@@ -1532,9 +1703,10 @@ export class SshMCP {
         files: z.array(z.object({
           localPath: z.string(),
           remotePath: z.string()
-        }))
+        })),
+        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
       },
-      async ({ connectionId, files }) => {
+      async ({ connectionId, files, confirmation }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -1572,7 +1744,19 @@ export class SshMCP {
           
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
-          
+
+          const operationSummary = `batch upload ${files.length} local files to remote destinations: ${files.map(file => `${file.localPath} -> ${file.remotePath}`).join('; ')}`;
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId,
+            command: operationSummary,
+            confirmation,
+            operationType: 'batch_file_upload',
+            operationSummary
+          });
+          if (policyAssessment.response) {
+            return policyAssessment.response;
+          }
+           
           // 批量传输文件
           const transferIds = await this.sshService.batchTransfer({
             connectionId,
@@ -1664,9 +1848,10 @@ export class SshMCP {
         files: z.array(z.object({
           remotePath: z.string(),
           localPath: z.string().optional()
-        }))
+        })),
+        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
       },
-      async ({ connectionId, files }) => {
+      async ({ connectionId, files, confirmation }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -1724,7 +1909,19 @@ export class SshMCP {
           
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
-          
+
+          const operationSummary = `batch download ${normalizedFiles.length} remote files to local destinations: ${normalizedFiles.map(file => `${file.remotePath} -> ${file.localPath}`).join('; ')}`;
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId,
+            command: operationSummary,
+            confirmation,
+            operationType: 'batch_file_download',
+            operationSummary
+          });
+          if (policyAssessment.response) {
+            return policyAssessment.response;
+          }
+           
           // 开始批量下载
           const transferIds = await this.sshService.batchTransfer({
             connectionId,
@@ -2198,11 +2395,24 @@ export class SshMCP {
       "Writes data to an interactive terminal session.",
       {
         sessionId: z.string(),
-        data: z.string()
+        data: z.string(),
+        confirmation: z.string().optional().describe("Confirmation string required for risky terminal writes")
       },
       async (params) => {
         try {
-          const { sessionId, data } = params;
+          const { sessionId, data, confirmation } = params;
+          const operationSummary = `write terminal input to session ${sessionId}: ${data}`;
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId: `terminal:${sessionId}`,
+            command: operationSummary,
+            confirmation,
+            operationType: 'terminal_write',
+            operationSummary
+          });
+          if (policyAssessment.response) {
+            return policyAssessment.response;
+          }
+
           const success = await this.sshService.writeToTerminal(sessionId, data);
           
           return {
@@ -2238,9 +2448,10 @@ export class SshMCP {
         localPort: z.number(),
         remoteHost: z.string(),
         remotePort: z.number(),
-        description: z.string().optional()
+        description: z.string().optional(),
+        confirmation: z.string().optional().describe("Confirmation string required for tunnel creation approval")
       },
-      async ({ connectionId, localPort, remoteHost, remotePort, description }) => {
+      async ({ connectionId, localPort, remoteHost, remotePort, description, confirmation }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           
@@ -2263,7 +2474,19 @@ export class SshMCP {
               isError: true
             };
           }
-          
+
+          const operationSummary = `create SSH tunnel from local port ${localPort} to ${remoteHost}:${remotePort}${description ? ` (${description})` : ''}`;
+          const policyAssessment = await this.assessOperationPolicy({
+            connectionId,
+            command: operationSummary,
+            confirmation,
+            operationType: 'tunnel_create',
+            operationSummary
+          });
+          if (policyAssessment.response) {
+            return policyAssessment.response;
+          }
+           
           // 创建隧道
           const tunnelId = await this.sshService.createTunnel({
             connectionId,

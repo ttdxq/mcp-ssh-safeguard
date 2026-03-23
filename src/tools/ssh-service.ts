@@ -10,6 +10,7 @@ import { EventEmitter } from 'events';
 import * as net from 'net';
 import { Client as SSHClient, ConnectConfig, SFTPWrapper } from 'ssh2';
 import { SSHExecCommandResponse, SSHExecOptions } from 'node-ssh';
+import { isInsecureDockerCredentialPersistenceEnabled, resolveDataPath } from '../services/runtime-config.js';
 
 // 连接配置
 export interface SSHConnectionConfig {
@@ -158,6 +159,7 @@ export class SSHService {
   private serviceReady: boolean = false;
   private serviceReadyPromise: Promise<void>;
   private isDocker: boolean = false;
+  private allowInsecureDockerCredentialPersistence: boolean = false;
   
   // 后台任务管理
   private backgroundTasks: Map<string, BackgroundTask> = new Map();
@@ -180,8 +182,18 @@ export class SSHService {
   private terminalSessions: Map<string, TerminalSession> = new Map();
   
   constructor() {
-    this.dataPath = process.env.SSH_DATA_PATH || path.join(os.homedir(), '.mcp-ssh');
+    const { dataPath, warning } = resolveDataPath();
+    this.dataPath = dataPath;
     this.isDocker = process.env.IS_DOCKER === 'true';
+    this.allowInsecureDockerCredentialPersistence = this.isDocker && isInsecureDockerCredentialPersistenceEnabled();
+
+    if (warning) {
+      console.warn(warning);
+    }
+
+    if (this.isDocker && !this.allowInsecureDockerCredentialPersistence) {
+      console.warn('Docker mode disables remembered passwords by default; set ALLOW_INSECURE_DOCKER_CREDENTIALS=true to restore the old plaintext behavior.');
+    }
     
     // 创建数据目录（如果不存在）
     if (!fs.existsSync(this.dataPath)) {
@@ -313,6 +325,10 @@ export class SSHService {
   
   private async saveCredentials(id: string, password?: string, passphrase?: string): Promise<void> {
     if (this.isDocker) {
+      if (!this.allowInsecureDockerCredentialPersistence) {
+        return;
+      }
+
       await this.ensureReady();
       if (!this.credentialCollection) return;
 
@@ -341,6 +357,10 @@ export class SSHService {
   
   private async getCredentials(id: string): Promise<{password?: string, passphrase?: string}> {
     if (this.isDocker) {
+      if (!this.allowInsecureDockerCredentialPersistence) {
+        return {};
+      }
+
       await this.ensureReady();
       if (!this.credentialCollection) return {};
       const creds = this.credentialCollection.findOne({ id });
@@ -554,23 +574,15 @@ export class SSHService {
         execOptions.execOptions = { timeout: parseInt(process.env.COMMAND_TIMEOUT) };
       }
 
-      // 检查是否是sudo命令
-      if (command.trim().startsWith('sudo ') || command.includes(' sudo ')) {
-        // 尝试获取密码
-        let password = connection.config.password;
-        if (!password) {
-          const savedCredentials = await this.getCredentials(connection.id);
-          password = savedCredentials.password;
+      const sudoPassword = await this.getSudoPassword(connection, command);
+      if (sudoPassword) {
+        const result = await this.executeSudoCommand(connection, command, sudoPassword, options);
+
+        if (command.trim().startsWith('cd ')) {
+          connection.currentDirectory = await this.getCurrentDirectory(connectionId);
         }
 
-        // 如果有密码，使用echo密码 | sudo -S 的方式运行
-        if (password) {
-          // 修改命令以自动提供密码
-          // 使用 -S 标志让sudo从标准输入读取密码
-          const sudoCommand = command.replace(/\bsudo\b/g, 'sudo -S');
-          // 使用echo和管道传递密码，并添加命令使sudo在用户输入时不显示
-          command = `echo "${password}" | ${sudoCommand} 2>/dev/null`;
-        }
+        return result;
       }
       
       // 执行命令
@@ -616,31 +628,28 @@ export class SSHService {
         execOptions.cwd = connection.currentDirectory;
       }
 
-      // 检查是否是sudo命令
-      if (command.trim().startsWith('sudo ') || command.includes(' sudo ')) {
-        // 尝试获取密码
-        let password = connection.config.password;
-        if (!password) {
-          const savedCredentials = await this.getCredentials(connection.id);
-          password = savedCredentials.password;
-        }
-
-        // 如果有密码，使用echo密码 | sudo -S 的方式运行
-        if (password) {
-          // 修改命令以自动提供密码
-          // 使用 -S 标志让sudo从标准输入读取密码
-          const sudoCommand = command.replace(/\bsudo\b/g, 'sudo -S');
-          // 使用echo和管道传递密码，并添加命令使sudo在用户输入时不显示
-          command = `echo "${password}" | ${sudoCommand} 2>/dev/null`;
-        }
-      }
-      
       // 创建一个唯一任务ID
       const taskId = crypto
         .createHash('md5')
         .update(`${connectionId}:${command}:${Date.now()}`)
         .digest('hex');
-      
+
+      const sudoPassword = await this.getSudoPassword(connection, command);
+      if (sudoPassword) {
+        const process = await this.startSudoBackgroundCommand(connection, command, sudoPassword, execOptions.cwd, taskId);
+        const task: BackgroundTask = {
+          client: connection.client,
+          process,
+          output: '',
+          isRunning: true,
+          startTime: new Date()
+        };
+
+        this.backgroundTasks.set(taskId, task);
+        this.attachBackgroundProcessHandlers(taskId, process, options?.interval);
+        return taskId;
+      }
+       
       // 启动后台进程
       const process = await connection.client.exec(command, [], {
         cwd: execOptions.cwd,
@@ -671,106 +680,300 @@ export class SSHService {
       };
       
       this.backgroundTasks.set(taskId, task);
-      
-      // 处理进程结束
-      if (process && typeof process === 'object' && process.hasOwnProperty('code')) {
-        // 如果已经有code属性，表示进程已经结束
-        const code = (process as any).code;
-        task.isRunning = false;
-        task.exitCode = typeof code === 'number' ? code : 0;
-        task.endTime = new Date();
-        
-        this.eventEmitter.emit('task-end', { 
-          id: taskId, 
-          output: task.output, 
-          exitCode: task.exitCode,
-          startTime: task.startTime,
-          endTime: task.endTime
-        });
-      } else {
-        // 监听进程的子事件来检测完成
-        // node-ssh的exec返回有可能不包含标准属性，所以使用一个定时器来检查任务是否完成
-        const checkInterval = setInterval(() => {
-          const currentTask = this.backgroundTasks.get(taskId);
-          if (currentTask && currentTask.isRunning && process && 
-              typeof process === 'object' && process.hasOwnProperty('code')) {
-            // 进程已完成
-            clearInterval(checkInterval);
-            
-            const code = (process as any).code;
-            currentTask.isRunning = false;
-            currentTask.exitCode = typeof code === 'number' ? code : 0;
-            currentTask.endTime = new Date();
-            
-            // 停止间隔发送
-            if (currentTask.interval) {
-              clearInterval(currentTask.interval);
-              currentTask.interval = undefined;
-            }
-            
-            this.eventEmitter.emit('task-end', { 
-              id: taskId, 
-              output: currentTask.output, 
-              exitCode: currentTask.exitCode,
-              startTime: currentTask.startTime,
-              endTime: currentTask.endTime
-            });
-          }
-        }, 1000); // 每秒检查一次
-        
-        // 5分钟后强制结束检查，避免无限循环
-        setTimeout(() => {
-          clearInterval(checkInterval);
-          const currentTask = this.backgroundTasks.get(taskId);
-          if (currentTask && currentTask.isRunning) {
-            // 强制标记为已完成
-            currentTask.isRunning = false;
-            currentTask.exitCode = -1; // 表示超时
-            currentTask.endTime = new Date();
-            
-            // 停止间隔发送
-            if (currentTask.interval) {
-              clearInterval(currentTask.interval);
-              currentTask.interval = undefined;
-            }
-            
-            this.eventEmitter.emit('task-end', { 
-              id: taskId, 
-              output: currentTask.output, 
-              exitCode: currentTask.exitCode,
-              startTime: currentTask.startTime,
-              endTime: currentTask.endTime
-            });
-          }
-        }, 5 * 60 * 1000); // 5分钟
-      }
-      
-      // 如果设置了间隔，定期发送输出
-      if (options?.interval) {
-        const interval = setInterval(() => {
-          const task = this.backgroundTasks.get(taskId);
-          if (task && task.isRunning) {
-            this.eventEmitter.emit('task-update', { 
-              id: taskId, 
-              output: task.output,
-              isRunning: true,
-              startTime: task.startTime
-            });
-          } else {
-            clearInterval(interval);
-          }
-        }, options.interval);
-        
-        const task = this.backgroundTasks.get(taskId);
-        if (task) {
-          task.interval = interval;
-        }
-      }
+      this.attachBackgroundProcessHandlers(taskId, process, options?.interval);
       
       return taskId;
     } catch (error) {
       console.error(`在连接 ${connectionId} 上启动后台命令时出错:`, error);
       throw error;
+    }
+  }
+
+  public canPersistCredentials(): boolean {
+    return !this.isDocker || this.allowInsecureDockerCredentialPersistence;
+  }
+
+  private async getSudoPassword(connection: SSHConnection, command: string): Promise<string | undefined> {
+    if (!this.isSudoCommand(command)) {
+      return undefined;
+    }
+
+    let password = connection.config.password;
+    if (!password) {
+      const savedCredentials = await this.getCredentials(connection.id);
+      password = savedCredentials.password;
+    }
+
+    return password;
+  }
+
+  private isSudoCommand(command: string): boolean {
+    return command.trim().startsWith('sudo ') || command.includes(' sudo ');
+  }
+
+  private getRawSshClient(connection: SSHConnection): SSHClient {
+    const sshClient = (connection.client as NodeSSH & { connection?: SSHClient }).connection;
+    if (!sshClient) {
+      throw new Error('无法获取底层SSH连接');
+    }
+
+    return sshClient;
+  }
+
+  private wrapCommandWithCwd(command: string, cwd?: string): string {
+    if (!cwd) {
+      return command;
+    }
+
+    const escapedCwd = cwd.replace(/'/g, `'"'"'`);
+    return `cd '${escapedCwd}' && ${command}`;
+  }
+
+  private normalizeSudoCommand(command: string): string {
+    return command.replace(/\bsudo\b/g, 'sudo -S -p ""');
+  }
+
+  private async executeSudoCommand(
+    connection: SSHConnection,
+    command: string,
+    password: string,
+    options?: { cwd?: string, timeout?: number }
+  ): Promise<CommandResult> {
+    const sshClient = this.getRawSshClient(connection);
+    const wrappedCommand = this.wrapCommandWithCwd(this.normalizeSudoCommand(command), options?.cwd ?? connection.currentDirectory);
+
+    return await new Promise<CommandResult>((resolve, reject) => {
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+
+      const timeout = options?.timeout
+        ?? (process.env.COMMAND_TIMEOUT && parseInt(process.env.COMMAND_TIMEOUT) > 0
+          ? parseInt(process.env.COMMAND_TIMEOUT)
+          : undefined);
+
+      let timeoutHandle: NodeJS.Timeout | undefined;
+      if (timeout) {
+        timeoutHandle = setTimeout(() => {
+          settled = true;
+          reject(new Error(`命令执行超时 (${timeout}ms)`));
+        }, timeout);
+      }
+
+      sshClient.exec(wrappedCommand, (err, stream) => {
+        if (err) {
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+          }
+          reject(err);
+          return;
+        }
+
+        stream.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString('utf8');
+        });
+
+        stream.stderr.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString('utf8');
+        });
+
+        stream.on('close', (code?: number) => {
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+          }
+          if (settled) {
+            return;
+          }
+          settled = true;
+          resolve({
+            stdout,
+            stderr,
+            code: typeof code === 'number' ? code : 0
+          });
+        });
+
+        stream.on('error', (streamError: Error) => {
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+          }
+          if (settled) {
+            return;
+          }
+          settled = true;
+          reject(streamError);
+        });
+
+        stream.write(`${password}\n`);
+      });
+    });
+  }
+
+  private async startSudoBackgroundCommand(
+    connection: SSHConnection,
+    command: string,
+    password: string,
+    cwd: string | undefined,
+    taskId: string
+  ): Promise<SSHExecCommandResponse> {
+    const sshClient = this.getRawSshClient(connection);
+    const wrappedCommand = this.wrapCommandWithCwd(this.normalizeSudoCommand(command), cwd ?? connection.currentDirectory);
+
+    return await new Promise<SSHExecCommandResponse>((resolve, reject) => {
+      sshClient.exec(wrappedCommand, (err, stream) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+
+        stream.on('data', (chunk: Buffer) => {
+          const task = this.backgroundTasks.get(taskId);
+          if (task) {
+            task.output += chunk.toString('utf8');
+            this.eventEmitter.emit('task-update', { id: taskId, output: task.output });
+          }
+        });
+
+        stream.stderr.on('data', (chunk: Buffer) => {
+          const task = this.backgroundTasks.get(taskId);
+          if (task) {
+            task.output += chunk.toString('utf8');
+            this.eventEmitter.emit('task-update', { id: taskId, output: task.output });
+          }
+        });
+
+        stream.write(`${password}\n`);
+        resolve(stream as unknown as SSHExecCommandResponse);
+      });
+    });
+  }
+
+  private attachBackgroundProcessHandlers(taskId: string, process: SSHExecCommandResponse, intervalMs?: number): void {
+    const task = this.backgroundTasks.get(taskId);
+    if (!task) {
+      return;
+    }
+
+    let checkInterval: NodeJS.Timeout | undefined;
+    let timeoutHandle: NodeJS.Timeout | undefined;
+
+    if (process && typeof process === 'object' && Object.prototype.hasOwnProperty.call(process, 'code')) {
+      const code = (process as unknown as { code?: number }).code;
+      task.isRunning = false;
+      task.exitCode = typeof code === 'number' ? code : 0;
+      task.endTime = new Date();
+
+      this.eventEmitter.emit('task-end', {
+        id: taskId,
+        output: task.output,
+        exitCode: task.exitCode,
+        startTime: task.startTime,
+        endTime: task.endTime
+      });
+      return;
+    }
+
+    const channel = process as unknown as { on?: (event: string, handler: (...args: unknown[]) => void) => void };
+    if (channel.on) {
+      channel.on('close', (...args: unknown[]) => {
+        if (checkInterval) {
+          clearInterval(checkInterval);
+          checkInterval = undefined;
+        }
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = undefined;
+        }
+
+        const currentTask = this.backgroundTasks.get(taskId);
+        if (!currentTask || !currentTask.isRunning) {
+          return;
+        }
+
+        const code = typeof args[0] === 'number' ? args[0] : 0;
+        currentTask.isRunning = false;
+        currentTask.exitCode = code;
+        currentTask.endTime = new Date();
+
+        if (currentTask.interval) {
+          clearInterval(currentTask.interval);
+          currentTask.interval = undefined;
+        }
+
+        this.eventEmitter.emit('task-end', {
+          id: taskId,
+          output: currentTask.output,
+          exitCode: currentTask.exitCode,
+          startTime: currentTask.startTime,
+          endTime: currentTask.endTime
+        });
+      });
+    }
+
+    checkInterval = setInterval(() => {
+      const currentTask = this.backgroundTasks.get(taskId);
+      if (currentTask && currentTask.isRunning && process &&
+          typeof process === 'object' && Object.prototype.hasOwnProperty.call(process, 'code')) {
+        clearInterval(checkInterval);
+
+        const code = (process as unknown as { code?: number }).code;
+        currentTask.isRunning = false;
+        currentTask.exitCode = typeof code === 'number' ? code : 0;
+        currentTask.endTime = new Date();
+
+        if (currentTask.interval) {
+          clearInterval(currentTask.interval);
+          currentTask.interval = undefined;
+        }
+
+        this.eventEmitter.emit('task-end', {
+          id: taskId,
+          output: currentTask.output,
+          exitCode: currentTask.exitCode,
+          startTime: currentTask.startTime,
+          endTime: currentTask.endTime
+        });
+      }
+    }, 1000);
+
+    timeoutHandle = setTimeout(() => {
+      clearInterval(checkInterval);
+      const currentTask = this.backgroundTasks.get(taskId);
+      if (currentTask && currentTask.isRunning) {
+        currentTask.isRunning = false;
+        currentTask.exitCode = -1;
+        currentTask.endTime = new Date();
+
+        if (currentTask.interval) {
+          clearInterval(currentTask.interval);
+          currentTask.interval = undefined;
+        }
+
+        this.eventEmitter.emit('task-end', {
+          id: taskId,
+          output: currentTask.output,
+          exitCode: currentTask.exitCode,
+          startTime: currentTask.startTime,
+          endTime: currentTask.endTime
+        });
+      }
+    }, 5 * 60 * 1000);
+
+    if (intervalMs) {
+      const interval = setInterval(() => {
+        const currentTask = this.backgroundTasks.get(taskId);
+        if (currentTask && currentTask.isRunning) {
+          this.eventEmitter.emit('task-update', {
+            id: taskId,
+            output: currentTask.output,
+            isRunning: true,
+            startTime: currentTask.startTime
+          });
+        } else {
+          clearInterval(interval);
+        }
+      }, intervalMs);
+
+      task.interval = interval;
     }
   }
   
