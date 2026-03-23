@@ -133,6 +133,59 @@ npm run build
 
 说明：兼容 OpenAI 风格和方舟风格变量名；例如 `OPENAI_API_KEY`/`ARK_API_KEY`、`OPENAI_API_BASE`/`ARK_API_BASE`、`OPENAI_MODEL`/`ARK_MODEL` 都可用于初始化 AI 安全检查。
 
+**如何配置基于 AI 的安全检查**
+
+AI 安全检查会在 `executeCommand`、`backgroundExecute`、文件传输、隧道创建和 terminal 写入之前执行。要让它真正生效，至少需要满足下面几个条件：
+
+1. `SAFETY_CHECK_ENABLED` 设为 `true`
+2. 提供 API Key：`OPENAI_API_KEY` 或 `ARK_API_KEY`
+3. 提供兼容 OpenAI Chat Completions 的接口地址：`OPENAI_API_BASE` 或 `ARK_API_BASE`
+4. 提供模型名：`OPENAI_MODEL` 或 `ARK_MODEL`
+
+注意：只有 `SAFETY_CHECK_ENABLED=true` 但没有 API Key 时，运行时不会初始化 AI 安全检查服务。
+
+推荐最小配置：
+
+```json
+{
+  "OPENAI_API_KEY": "your-api-key",
+  "OPENAI_API_BASE": "https://api.openai.com/v1",
+  "OPENAI_MODEL": "gpt-4.1-mini",
+  "OPENAI_TIMEOUT": "30000",
+  "OPENAI_THINKING_TYPE": "disabled",
+  "SAFETY_CHECK_ENABLED": "true"
+}
+```
+
+字段说明：
+
+- `OPENAI_API_KEY`: 必填，AI 提供商的 API Key
+- `OPENAI_API_BASE`: 必填，兼容 OpenAI 的接口地址
+- `OPENAI_MODEL`: 必填，用于安全检查的模型名
+- `OPENAI_TIMEOUT`: 可选，单位毫秒；供应商响应较慢时可以调大
+- `OPENAI_THINKING_TYPE`: 可选，支持 `disabled`、`enabled`、`auto`
+- `SAFETY_CHECK_ENABLED`: 可选，显式控制是否启用 AI 安全检查
+
+如果你使用兼容 OpenAI 协议的其他供应商，也可以直接使用兼容别名：
+
+```json
+{
+  "ARK_API_KEY": "your-api-key",
+  "ARK_API_BASE": "https://your-provider.example.com/v1",
+  "ARK_MODEL": "your-model-name",
+  "ARK_TIMEOUT": "30000",
+  "ARK_THINKING_TYPE": "disabled",
+  "SAFETY_CHECK_ENABLED": "true"
+}
+```
+
+运行时会优先读取 `OPENAI_*`，如果没提供，再兼容读取 `ARK_*`。两套变量最好不要混着写成不同值。
+
+配置完成后，可以用下面两种请求确认它是否已经生效：
+
+- 低风险命令如 `pwd` 应直接通过
+- 高风险命令如 `rm -rf /` 应先被拦截并要求确认，而不是直接发送到远端主机
+
 > ⚠️ **请注意**:
 > - 将 `你的用户名` 替换为你的 Windows 用户名
 > - 确保路径正确指向你克隆或解压的项目目录
@@ -167,6 +220,8 @@ npm run build
         "OPENAI_API_KEY": "your-api-key-here",
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
+        "OPENAI_TIMEOUT": "30000",
+        "OPENAI_THINKING_TYPE": "disabled",
         "SAFETY_CHECK_ENABLED": "true",
         "MAX_OUTPUT_LENGTH": "3000"
       }
@@ -209,6 +264,8 @@ npm run build
         "OPENAI_API_KEY": "your-api-key-here",
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
+        "OPENAI_TIMEOUT": "30000",
+        "OPENAI_THINKING_TYPE": "disabled",
         "SAFETY_CHECK_ENABLED": "true",
         "MAX_OUTPUT_LENGTH": "3000"
       }

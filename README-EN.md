@@ -133,6 +133,59 @@ Note: AI safety checks now support `OPENAI_TIMEOUT` for provider-specific reques
 
 Note: the safety client accepts both OpenAI-style and Ark-style variable names, such as `OPENAI_API_KEY`/`ARK_API_KEY`, `OPENAI_API_BASE`/`ARK_API_BASE`, and `OPENAI_MODEL`/`ARK_MODEL`.
 
+**How to configure AI-based safety checks**
+
+AI safety checks run before `executeCommand`, `backgroundExecute`, file transfers, tunnel creation, and terminal writes. To enable them for real, all of the following must be true:
+
+1. `SAFETY_CHECK_ENABLED` is set to `true`
+2. A valid API key is provided through `OPENAI_API_KEY` or `ARK_API_KEY`
+3. A compatible Chat Completions base URL is provided through `OPENAI_API_BASE` or `ARK_API_BASE`
+4. A model name is provided through `OPENAI_MODEL` or `ARK_MODEL`
+
+Important: setting `SAFETY_CHECK_ENABLED=true` alone is not enough. If no API key is present, the runtime will not initialize the AI safety checker.
+
+Recommended minimal setup:
+
+```json
+{
+  "OPENAI_API_KEY": "your-api-key",
+  "OPENAI_API_BASE": "https://api.openai.com/v1",
+  "OPENAI_MODEL": "gpt-4.1-mini",
+  "OPENAI_TIMEOUT": "30000",
+  "OPENAI_THINKING_TYPE": "disabled",
+  "SAFETY_CHECK_ENABLED": "true"
+}
+```
+
+Field guide:
+
+- `OPENAI_API_KEY`: required provider API key
+- `OPENAI_API_BASE`: required OpenAI-compatible endpoint
+- `OPENAI_MODEL`: required model used for safety review
+- `OPENAI_TIMEOUT`: optional timeout in milliseconds
+- `OPENAI_THINKING_TYPE`: optional thinking mode, one of `disabled`, `enabled`, or `auto`
+- `SAFETY_CHECK_ENABLED`: optional explicit switch for the AI safety layer
+
+If you use another provider with an OpenAI-compatible API, you can also configure the Ark-style aliases instead:
+
+```json
+{
+  "ARK_API_KEY": "your-api-key",
+  "ARK_API_BASE": "https://your-provider.example.com/v1",
+  "ARK_MODEL": "your-model-name",
+  "ARK_TIMEOUT": "30000",
+  "ARK_THINKING_TYPE": "disabled",
+  "SAFETY_CHECK_ENABLED": "true"
+}
+```
+
+At runtime, `OPENAI_*` variables take priority, and `ARK_*` variables are used as compatible fallbacks. Avoid setting both groups to different values.
+
+After configuration, verify the behavior with one low-risk and one high-risk request:
+
+- A low-risk command like `pwd` should pass directly
+- A high-risk command like `rm -rf /` should be blocked and require confirmation before anything reaches the remote host
+
 > ⚠️ **Please note**:
 > - Replace `YourUsername` with your Windows username
 > - Make sure the path correctly points to your cloned or extracted project directory
@@ -167,6 +220,8 @@ Note: the safety client accepts both OpenAI-style and Ark-style variable names, 
         "OPENAI_API_KEY": "your-api-key-here",
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
+        "OPENAI_TIMEOUT": "30000",
+        "OPENAI_THINKING_TYPE": "disabled",
         "SAFETY_CHECK_ENABLED": "true",
         "MAX_OUTPUT_LENGTH": "3000"
       }
@@ -209,6 +264,8 @@ Note: the safety client accepts both OpenAI-style and Ark-style variable names, 
         "OPENAI_API_KEY": "your-api-key-here",
         "OPENAI_API_BASE": "https://api.openai.com/v1",
         "OPENAI_MODEL": "gpt-3.5-turbo",
+        "OPENAI_TIMEOUT": "30000",
+        "OPENAI_THINKING_TYPE": "disabled",
         "SAFETY_CHECK_ENABLED": "true",
         "MAX_OUTPUT_LENGTH": "3000"
       }
