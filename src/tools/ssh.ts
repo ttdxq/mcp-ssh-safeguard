@@ -276,13 +276,7 @@ export class SshMCP {
     }
 
     if (!this.safetyCheckService) {
-      return {
-        allowed: false,
-        response: {
-          content: [{ type: 'text', text: '安全检查已禁用（SAFETY_CHECK_ENABLED=false），所有操作被拒绝。如需执行操作请启用安全检查。' }],
-          isError: true
-        }
-      };
+      return { allowed: true };
     }
 
     let safetyResult = await this.safetyCheckService.checkCommandSafety(command);
