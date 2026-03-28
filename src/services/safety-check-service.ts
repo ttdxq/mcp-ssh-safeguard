@@ -16,25 +16,32 @@ interface CachedSafetyResult {
 }
 
 export class SafetyCheckService {
-  private openai: OpenAI;
+  private openai: OpenAI | null = null;
+  private readonly localOnly: boolean;
   private cache: Map<string, CachedSafetyResult> = new Map();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
   private readonly MAX_CACHE_SIZE = 100;
   private readonly thinkingMode: ThinkingMode;
+  private readonly model: string;
 
   constructor(
-    apiKey: string,
+    apiKey?: string,
     apiBase?: string,
-    private model: string = 'gpt-3.5-turbo',
+    model: string = 'gpt-3.5-turbo',
     timeout: number = 30000,
     thinkingMode: ThinkingMode = 'disabled'
   ) {
-    this.openai = new OpenAI({
-      apiKey,
-      baseURL: apiBase || 'https://api.openai.com/v1',
-      timeout,
-      maxRetries: 1,
-    });
+    this.model = model;
+    this.localOnly = !apiKey;
+
+    if (apiKey) {
+      this.openai = new OpenAI({
+        apiKey,
+        baseURL: apiBase || 'https://api.openai.com/v1',
+        timeout,
+        maxRetries: 1,
+      });
+    }
     this.thinkingMode = thinkingMode;
   }
 
@@ -48,14 +55,21 @@ export class SafetyCheckService {
       return cached;
     }
 
+    // 2. 无 API Key 时直接使用本地规则
+    if (this.localOnly) {
+      const quickResult = this.quickCheck(command);
+      this.cacheResult(command, quickResult);
+      return quickResult;
+    }
+
     try {
-      // 2. 优先使用AI进行安全检查
+      // 3. 优先使用AI进行安全检查
       const result = await this.analyzeCommandWithAI(command);
       this.cacheResult(command, result);
       return result;
     } catch (error) {
       console.error('AI安全检查失败 (网络或解析错误):', error);
-      // 3. 降级方案：使用本地规则引擎
+      // 4. 降级方案：使用本地规则引擎
       console.warn('正在使用快速安全检查作为降级方案');
       const quickResult = this.quickCheck(command);
       this.cacheResult(command, quickResult);
@@ -67,6 +81,10 @@ export class SafetyCheckService {
    * 使用OpenAI API分析指令
    */
   private async analyzeCommandWithAI(command: string): Promise<SafetyCheckResult> {
+    if (!this.openai) {
+      throw new Error('OpenAI client is not initialized');
+    }
+
     // [优化] 更新后的Prompt，采用白名单策略，支持相对路径和归档操作
     const prompt = `你是一个Linux安全审计专家，服务于**开发和运维人员**。
 你的任务是判断指令是否对系统构成**实质性威胁**。请采用**“白名单宽容策略”**：如果是常见的开发/文件操作，且不涉及系统关键目录，一律视为 Safe。

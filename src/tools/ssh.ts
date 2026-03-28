@@ -32,9 +32,9 @@ export class SshMCP {
     // 初始化SSH服务
     this.sshService = new SSHService();
 
-    // 初始化安全检查服务（如果配置了API密钥）
-    const apiKey = process.env.OPENAI_API_KEY || process.env.ARK_API_KEY;
-    if (apiKey && process.env.SAFETY_CHECK_ENABLED !== 'false') {
+    // 初始化安全检查服务（有 API Key 时使用 AI 检查，否则使用本地规则）
+    if (process.env.SAFETY_CHECK_ENABLED !== 'false') {
+      const apiKey = process.env.OPENAI_API_KEY || process.env.ARK_API_KEY;
       const apiBase = process.env.OPENAI_API_BASE || process.env.ARK_API_BASE;
       const model = process.env.OPENAI_MODEL || process.env.ARK_MODEL || 'gpt-3.5-turbo';
       const timeout = parseInt(process.env.OPENAI_TIMEOUT || process.env.ARK_TIMEOUT || '30000', 10);
@@ -202,31 +202,6 @@ export class SshMCP {
     return `${operationType}:${connectionId}:${command}`;
   }
 
-  private isFailClosedAllowedCommand(command: string): boolean {
-    const normalizedCommand = command.trim().toLowerCase();
-    if (!normalizedCommand || normalizedCommand.includes('&&') || normalizedCommand.includes(';') || normalizedCommand.includes('|')) {
-      return false;
-    }
-
-    const readOnlyPatterns = [
-      /^pwd$/,
-      /^whoami$/,
-      /^hostname$/,
-      /^uname(?:\s+-[a-z]+)*$/,
-      /^id$/,
-      /^date$/,
-      /^ls(?:\s+[-\w./~]+)*$/,
-      /^cat\s+[-\w./~]+$/,
-      /^head\s+[-\w./~\s]+$/,
-      /^tail\s+[-\w./~\s]+$/,
-      /^df(?:\s+-[a-z]+)*$/,
-      /^free(?:\s+-[a-z]+)*$/,
-      /^ps(?:\s+[-\w]+)*$/
-    ];
-
-    return readOnlyPatterns.some((pattern) => pattern.test(normalizedCommand));
-  }
-
   private buildPendingConfirmationResponse(operationSummary: string, safetyResult: SafetyCheckResult): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
     if (safetyResult.level === 'moderate') {
       return {
@@ -242,27 +217,6 @@ export class SshMCP {
         type: 'text',
         text: `🚨 危险操作检测 🚨\n\n操作: "${operationSummary}"\n风险等级: 危险\n原因: ${safetyResult.reason}\n${safetyResult.consequences ? `可能的后果: ${safetyResult.consequences}\n` : ''}\n如果确实需要执行，请再次输入完全相同的内容来确认。`
       }]
-    };
-  }
-
-  private buildFailClosedResponse(operationSummary: string, operationType: OperationRiskType): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
-    const operationLabelMap: Record<OperationRiskType, string> = {
-      command: '指令',
-      background_command: '后台指令',
-      file_upload: '文件上传',
-      file_download: '文件下载',
-      batch_file_upload: '批量文件上传',
-      batch_file_download: '批量文件下载',
-      tunnel_create: '隧道创建',
-      terminal_write: '终端写入'
-    };
-    const operationLabel = operationLabelMap[operationType];
-    return {
-      content: [{
-        type: 'text',
-        text: `🚨 高风险操作已拒绝 🚨\n\n${operationLabel}: "${operationSummary}"\n原因: AI 安全检查当前不可用，系统已进入默认拒绝模式。仅允许极小范围的只读命令通过，其他操作必须在安全检查恢复后再执行。`
-      }],
-      isError: true
     };
   }
 
@@ -322,13 +276,12 @@ export class SshMCP {
     }
 
     if (!this.safetyCheckService) {
-      if (operationType === 'command' && this.isFailClosedAllowedCommand(command)) {
-        return { allowed: true };
-      }
-
       return {
         allowed: false,
-        response: this.buildFailClosedResponse(operationSummary, operationType)
+        response: {
+          content: [{ type: 'text', text: '安全检查已禁用（SAFETY_CHECK_ENABLED=false），所有操作被拒绝。如需执行操作请启用安全检查。' }],
+          isError: true
+        }
       };
     }
 
