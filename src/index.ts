@@ -11,8 +11,10 @@ config();
 process.stdin.resume();
 
 let shutdownPromise: Promise<void> | null = null;
+let isShuttingDown = false;
 
-async function shutdown(sshMCP: SshMCP, processManager: ProcessManager, exitCode: number, reason: string): Promise<void> {
+async function gracefulShutdown(sshMCP: SshMCP, processManager: ProcessManager, exitCode: number, reason: string): Promise<void> {
+  isShuttingDown = true;
   if (!shutdownPromise) {
     shutdownPromise = (async () => {
       console.error(reason);
@@ -41,23 +43,29 @@ async function main() {
   // 实例化SSH MCP
   const sshMCP = new SshMCP();
 
-  // 处理进程退出
+  // 处理进程退出 — 仅 SIGINT/SIGTERM 才真正关闭进程
   process.on('SIGINT', async () => {
-    await shutdown(sshMCP, processManager, 0, '正在关闭SSH MCP服务...');
+    await gracefulShutdown(sshMCP, processManager, 0, '正在关闭SSH MCP服务...');
   });
 
   process.on('SIGTERM', async () => {
-    await shutdown(sshMCP, processManager, 0, '正在关闭SSH MCP服务...');
+    await gracefulShutdown(sshMCP, processManager, 0, '正在关闭SSH MCP服务...');
   });
 
-  process.on('uncaughtException', async (err) => {
-    console.error('未捕获的异常:', err);
-    await shutdown(sshMCP, processManager, 1, '检测到致命异常，正在安全关闭SSH MCP服务...');
+  // uncaughtException / unhandledRejection 只记录日志，不杀进程
+  // 之前直接 process.exit(1) 会导致多轮使用后 MCP 服务端进程意外死亡
+  process.on('uncaughtException', (err) => {
+    console.error('未捕获的异常（不退出）:', err);
+    if (isShuttingDown) {
+      gracefulShutdown(sshMCP, processManager, 1, '关闭过程中发生异常').catch(() => process.exit(1));
+    }
   });
 
-  process.on('unhandledRejection', async (reason) => {
-    console.error('未处理的Promise拒绝:', reason);
-    await shutdown(sshMCP, processManager, 1, '检测到未处理的Promise拒绝，正在安全关闭SSH MCP服务...');
+  process.on('unhandledRejection', (reason) => {
+    console.error('未处理的Promise拒绝（不退出）:', reason);
+    if (isShuttingDown) {
+      gracefulShutdown(sshMCP, processManager, 1, '关闭过程中发生异常').catch(() => process.exit(1));
+    }
   });
 
   // 监听 stdin 的结束事件

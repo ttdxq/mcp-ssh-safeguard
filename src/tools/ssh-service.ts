@@ -181,6 +181,13 @@ export class SSHService {
   // 终端会话管理
   private terminalSessions: Map<string, TerminalSession> = new Map();
   
+  // 健康监控
+  private healthCheckTimer: NodeJS.Timeout | null = null;
+  private static readonly HEALTH_CHECK_INTERVAL = 30 * 1000;
+  private static readonly HEALTH_CHECK_TIMEOUT = 10 * 1000;
+  private static readonly MAX_RECONNECT_ATTEMPTS = 3;
+  private static readonly RECONNECT_DELAY = 5 * 1000;
+  
   constructor() {
     const { dataPath, warning } = resolveDataPath();
     this.dataPath = dataPath;
@@ -1703,46 +1710,53 @@ export class SSHService {
       
       // 设置数据处理
       stream.on('data', (data: Buffer) => {
-        const dataStr = data.toString('utf8');
-        
-        // 检测是否是sudo密码提示
-        if (dataStr.includes('[sudo] password for') || 
-            dataStr.includes('Password:') || 
-            dataStr.includes('密码：')) {
-          // 标记为sudo密码提示
-          session.sudoPasswordPrompt = true;
+        try {
+          const dataStr = data.toString('utf8');
           
-          // 获取密码
-          const connection = this.connections.get(connectionId);
-          if (connection) {
-            // 尝试直接从连接获取密码
-            let password = connection.config.password;
-            if (!password) {
-              // 如果连接对象中没有密码，从凭据存储获取
-              this.getCredentials(connection.id).then(credentials => {
-                if (credentials.password) {
-                  // 自动提供密码
-                  stream.write(`${credentials.password}\n`);
-                }
-              }).catch(err => {
-                console.error('获取SSH密码时出错:', err);
-              });
-            } else {
-              // 直接提供密码
-              stream.write(`${password}\n`);
+          // 检测是否是sudo密码提示
+          if (dataStr.includes('[sudo] password for') || 
+              dataStr.includes('Password:') || 
+              dataStr.includes('密码：')) {
+            // 标记为sudo密码提示
+            session.sudoPasswordPrompt = true;
+            
+            // 获取密码
+            const connection = this.connections.get(connectionId);
+            if (connection) {
+              // 尝试直接从连接获取密码
+              const password = connection.config.password;
+              if (!password) {
+                // 如果连接对象中没有密码，从凭据存储获取
+                this.getCredentials(connection.id).then(credentials => {
+                  try {
+                    if (credentials.password && session.isActive) {
+                      stream.write(`${credentials.password}\n`);
+                    }
+                  } catch (error) {
+                    console.error('自动提供SSH密码时出错:', error);
+                  }
+                }).catch((err: unknown) => {
+                  console.error('获取SSH密码时出错:', err);
+                });
+              } else {
+                // 直接提供密码
+                stream.write(`${password}\n`);
+              }
             }
           }
-        }
-        
-        this.eventEmitter.emit('terminal-data', {
-          sessionId,
-          data: dataStr
-        });
-        
-        // 更新最后活动时间
-        const currentSession = this.terminalSessions.get(sessionId);
-        if (currentSession) {
-          currentSession.lastActivity = new Date();
+          
+          this.eventEmitter.emit('terminal-data', {
+            sessionId,
+            data: dataStr
+          });
+          
+          // 更新最后活动时间
+          const currentSession = this.terminalSessions.get(sessionId);
+          if (currentSession) {
+            currentSession.lastActivity = new Date();
+          }
+        } catch (error) {
+          console.error(`处理终端会话 ${sessionId} 数据时出错:`, error);
         }
       });
       
@@ -1901,15 +1915,19 @@ export class SSHService {
   
   // 设置定期清理任务
   private setupCleanupTasks(): void {
-    // 每小时清理一次已完成的传输记录
     setInterval(() => {
       this.cleanupCompletedTransfers();
     }, 60 * 60 * 1000); // 1小时
     
-    // 每天清理一次长时间不活跃的资源
     setInterval(() => {
       this.cleanupInactiveResources();
     }, 24 * 60 * 60 * 1000); // 24小时
+
+    this.healthCheckTimer = setInterval(() => {
+      this.performHealthCheck().catch((err: unknown) => {
+        console.error('健康检查出错:', err);
+      });
+    }, SSHService.HEALTH_CHECK_INTERVAL);
   }
   
   // 清理已完成的传输记录
@@ -1950,9 +1968,109 @@ export class SSHService {
     
     console.error(`已清理不活跃资源，当前终端会话: ${this.terminalSessions.size}, 隧道: ${this.tunnels.size}`);
   }
+
+  private async performHealthCheck(): Promise<void> {
+    for (const [connectionId, connection] of this.connections.entries()) {
+      if (connection.status !== ConnectionStatus.CONNECTED || !connection.client) {
+        continue;
+      }
+
+      try {
+        const result = await Promise.race([
+          this.executeCommand(connectionId, 'echo __mcp_ssh_health_check__', {
+            timeout: SSHService.HEALTH_CHECK_TIMEOUT
+          }),
+          new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error('health check timeout')), SSHService.HEALTH_CHECK_TIMEOUT);
+          })
+        ]);
+
+        if (!result.stdout.includes('__mcp_ssh_health_check__')) {
+          throw new Error('health check returned unexpected output');
+        }
+      } catch (error) {
+        connection.status = ConnectionStatus.DISCONNECTED;
+        connection.lastError = error instanceof Error ? error.message : String(error);
+
+        try {
+          await connection.client.dispose();
+        } catch {
+        }
+
+        connection.client = undefined;
+
+        if (connection.config.reconnect) {
+          await this.tryReconnect(connectionId);
+        }
+      }
+    }
+  }
+
+  private async tryReconnect(connectionId: string): Promise<void> {
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
+      return;
+    }
+
+    const reconnectAttempts = connection.config.reconnectTries || SSHService.MAX_RECONNECT_ATTEMPTS;
+    const reconnectDelay = connection.config.reconnectDelay || SSHService.RECONNECT_DELAY;
+
+    connection.status = ConnectionStatus.RECONNECTING;
+
+    for (let attempt = 1; attempt <= reconnectAttempts; attempt++) {
+      try {
+        await new Promise(resolve => setTimeout(resolve, reconnectDelay));
+
+        const reconnectConfig: SSHConnectionConfig = {
+          ...connection.config
+        };
+
+        if (!reconnectConfig.password && !reconnectConfig.privateKey) {
+          const savedCredentials = await this.getCredentials(connectionId);
+          if (savedCredentials.password) {
+            reconnectConfig.password = savedCredentials.password;
+          }
+          if (savedCredentials.passphrase) {
+            reconnectConfig.passphrase = savedCredentials.passphrase;
+          }
+        }
+
+        const ssh = new NodeSSH();
+        await ssh.connect({
+          host: reconnectConfig.host,
+          port: reconnectConfig.port || parseInt(process.env.DEFAULT_SSH_PORT || '22'),
+          username: reconnectConfig.username,
+          password: reconnectConfig.password,
+          privateKey: reconnectConfig.privateKey,
+          passphrase: reconnectConfig.passphrase,
+          keepaliveInterval: reconnectConfig.keepaliveInterval || 60000,
+          readyTimeout: reconnectConfig.readyTimeout || parseInt(process.env.CONNECTION_TIMEOUT || '10000')
+        });
+
+        connection.client = ssh;
+        connection.status = ConnectionStatus.CONNECTED;
+        connection.lastUsed = new Date();
+        connection.lastError = undefined;
+        connection.currentDirectory = await this.getCurrentDirectory(connectionId);
+        await this.saveConnection(connection);
+        return;
+      } catch (error) {
+        connection.lastError = error instanceof Error ? error.message : String(error);
+        if (attempt === reconnectAttempts) {
+          connection.status = ConnectionStatus.ERROR;
+          return;
+        }
+      }
+    }
+  }
   
   // 关闭服务
   public async close(): Promise<void> {
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+
     // 关闭所有终端会话
     for (const sessionId of this.terminalSessions.keys()) {
       await this.closeTerminalSession(sessionId);
