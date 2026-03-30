@@ -574,12 +574,11 @@ export class SSHService {
         execOptions.cwd = connection.currentDirectory;
       }
       
-      // 超时
-      if (options?.timeout) {
-        execOptions.execOptions = { timeout: options.timeout };
-      } else if (process.env.COMMAND_TIMEOUT && parseInt(process.env.COMMAND_TIMEOUT) > 0) {
-        execOptions.execOptions = { timeout: parseInt(process.env.COMMAND_TIMEOUT) };
-      }
+      // 解析超时（ssh2 不支持 execOptions.timeout，需应用层控制）
+      const commandTimeout = options?.timeout
+        ?? (process.env.COMMAND_TIMEOUT && parseInt(process.env.COMMAND_TIMEOUT) > 0
+          ? parseInt(process.env.COMMAND_TIMEOUT)
+          : undefined);
 
       const sudoPassword = await this.getSudoPassword(connection, command);
       if (sudoPassword) {
@@ -592,8 +591,22 @@ export class SSHService {
         return result;
       }
       
-      // 执行命令
-      const result = await connection.client.execCommand(command, execOptions);
+      // 执行命令（带应用层超时控制）
+      let timeoutHandle: NodeJS.Timeout | undefined;
+      const resultPromise = connection.client.execCommand(command, execOptions);
+
+      const result = await (commandTimeout
+        ? Promise.race([
+            resultPromise,
+            new Promise<never>((_, reject) => {
+              timeoutHandle = setTimeout(
+                () => reject(new Error(`命令执行超时 (${commandTimeout}ms)`)),
+                commandTimeout
+              );
+            })
+          ]).finally(() => { if (timeoutHandle) clearTimeout(timeoutHandle); })
+        : resultPromise
+      );
       
       // 更新当前目录（如果是cd命令）
       if (command.trim().startsWith('cd ')) {
