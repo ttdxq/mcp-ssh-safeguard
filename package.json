@@ -12,7 +12,8 @@
     "dev": "ts-node-dev --respawn src/index.ts",
     "test": "npm run build && node --test",
     "register": "cursor tool register ssh-mcp -p dist/index.js",
-    "unregister": "cursor tool unregister ssh-mcp"
+    "unregister": "cursor tool unregister ssh-mcp",
+    "postinstall": "node scripts/patch-mcp-timeout.js"
   },
   "keywords": [
     "mcp",
