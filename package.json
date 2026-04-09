@@ -9,6 +9,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "mcp": "node dist/index.js",
+    "mcp:sse": "node dist/sse-server.js",
     "dev": "ts-node-dev --respawn src/index.ts",
     "test": "npm run build && node --test",
     "register": "cursor tool register ssh-mcp -p dist/index.js",

@@ -308,6 +308,82 @@ After configuration, restart the Cursor editor, and it will automatically start 
    ```
 </details>
 
+## Multi-Agent Concurrent Usage (SSE Mode)
+
+In the default stdio mode, each MCP client starts an independent Node.js process, and the process manager detects and terminates the old process. This means **only one agent can use the same configuration at a time** — starting a new agent will disconnect the previous one.
+
+SSE mode solves this problem: a persistent HTTP server process can serve multiple agent clients simultaneously.
+
+### Starting the SSE Server
+
+```bash
+# Build the project first (if not already built)
+npm run build
+
+# Start the SSE server
+npm run mcp:sse
+
+# Customize port and bind address (default: 127.0.0.1:3001)
+MCP_SSE_PORT=4000 MCP_SSE_HOST=0.0.0.0 npm run mcp:sse
+```
+
+After startup, you'll see:
+```
+[SSE] SSH MCP SSE server started → http://127.0.0.1:3001
+[SSE] SSE endpoint: http://127.0.0.1:3001/sse
+[SSE] Health check: http://127.0.0.1:3001/health
+[SSE] Waiting for client connections...
+```
+
+### Client MCP Configuration
+
+Replace the original `command` + `args` configuration with `url`:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-safeguard": {
+      "url": "http://127.0.0.1:3001/sse"
+    }
+  }
+}
+```
+
+If you need to configure environment variables (API keys, etc.), set them before starting the SSE server:
+
+```bash
+OPENAI_API_KEY=your-key OPENAI_API_BASE=https://api.openai.com/v1 OPENAI_MODEL=gpt-4.1-mini npm run mcp:sse
+```
+
+Or create a `.env` file in the project root:
+
+```env
+MCP_SSE_PORT=3001
+OPENAI_API_KEY=your-key
+OPENAI_API_BASE=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+SAFETY_CHECK_ENABLED=true
+```
+
+### Multiple Agents Connecting Simultaneously
+
+Once the SSE server is running, multiple agents can connect at the same time:
+
+| Agent | Behavior |
+|-------|----------|
+| Agent A connects | Assigned session-1, works normally |
+| Agent B connects | Assigned session-2, works normally, **Agent A is unaffected** |
+| Agent C connects | Assigned session-3, works normally, **A and B are unaffected** |
+| Agent A disconnects | session-1 closes, **B and C continue to work normally** |
+
+Visit `http://127.0.0.1:3001/health` to check the current number of active connections.
+
+> **Note**: In SSE mode, all agents share the same backend process's SSH connection pool and cache. If you need complete isolation, use stdio mode instead.
+
+### Backward Compatibility
+
+The original stdio mode (`command` + `args` configuration) is completely unaffected and requires no changes. You only need to switch to SSE mode when multiple agents need to use the service simultaneously.
+
 ## Usage Examples
 
 <details>

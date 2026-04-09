@@ -24,10 +24,14 @@ const LOCK_FILE = getLockFilePath();
 
 export class ProcessManager {
   private instanceId: string;
+  private skipLock: boolean;
 
-  constructor() {
+  constructor(skipLock: boolean = false) {
     this.instanceId = Date.now().toString();
-    this.registerCleanup();
+    this.skipLock = skipLock || !!process.env.MCP_SSE_PORT;
+    if (!this.skipLock) {
+      this.registerCleanup();
+    }
   }
 
   private registerCleanup(): void {
@@ -63,6 +67,12 @@ export class ProcessManager {
   }
 
   public async checkAndCreateLock(): Promise<boolean> {
+    // SSE 模式不需要进程锁（多个客户端连接到同一个进程是正常行为）
+    if (this.skipLock) {
+      console.error('SSE模式：跳过进程锁');
+      return true;
+    }
+
     try {
       // 2) 确保锁文件目录存在（避免 ENOENT）
       fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });

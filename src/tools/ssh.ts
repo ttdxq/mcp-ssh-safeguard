@@ -1,5 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+// StdioServerTransport 由调用方按需引入（index.ts / sse-server.ts）
 import { z } from 'zod';
 import { SSHService, SSHConnectionConfig, ConnectionStatus, TerminalSession, FileTransferInfo, BatchTransferConfig, TunnelConfig, CommandResult } from './ssh-service.js';
 import { SafetyCheckService, SafetyCheckResult } from '../services/safety-check-service.js';
@@ -19,20 +19,22 @@ interface OperationPolicyAssessment {
   };
 }
 
-export class SshMCP {
-  private server: McpServer;
-  private sshService: SSHService;
-  private safetyCheckService: SafetyCheckService | null = null;
-  private outputCacheService: OutputCacheService = new OutputCacheService();
-  private activeConnections: Map<string, Date> = new Map();
-  private backgroundExecutions: Map<string, { interval: NodeJS.Timeout, lastCheck: Date }> = new Map();
-  private pendingConfirmations: Map<string, { command: string, safetyResult: SafetyCheckResult }> = new Map();
+// ── 共享单例：所有 SshMCP 实例共用同一份服务和状态 ──
+let _sharedSshService: SSHService | null = null;
+let _sharedSafetyCheckService: SafetyCheckService | null = null;
+let _sharedOutputCacheService: OutputCacheService | null = null;
+let _sharedActiveConnections: Map<string, Date> | null = null;
+let _sharedBackgroundExecutions: Map<string, { interval: NodeJS.Timeout, lastCheck: Date }> | null = null;
 
-  constructor() {
-    // 初始化SSH服务
-    this.sshService = new SSHService();
+function getSharedSshService(): SSHService {
+  if (!_sharedSshService) {
+    _sharedSshService = new SSHService();
+  }
+  return _sharedSshService;
+}
 
-    // 初始化安全检查服务（有 API Key 时使用 AI 检查，否则使用本地规则）
+function getSharedSafetyCheckService(): SafetyCheckService | null {
+  if (!_sharedSafetyCheckService) {
     if (process.env.SAFETY_CHECK_ENABLED !== 'false') {
       const apiKey = process.env.OPENAI_API_KEY || process.env.ARK_API_KEY;
       const apiBase = process.env.OPENAI_API_BASE || process.env.ARK_API_BASE;
@@ -42,10 +44,53 @@ export class SshMCP {
       const thinkingType = configuredThinkingType === 'enabled' || configuredThinkingType === 'auto'
         ? configuredThinkingType
         : 'disabled';
-      this.safetyCheckService = new SafetyCheckService(apiKey, apiBase, model, timeout, thinkingType);
+      _sharedSafetyCheckService = new SafetyCheckService(apiKey, apiBase, model, timeout, thinkingType);
+    } else {
+      _sharedSafetyCheckService = null;
     }
+  }
+  return _sharedSafetyCheckService;
+}
 
-    // 初始化MCP服务器
+function getSharedOutputCacheService(): OutputCacheService {
+  if (!_sharedOutputCacheService) {
+    _sharedOutputCacheService = new OutputCacheService();
+  }
+  return _sharedOutputCacheService;
+}
+
+function getSharedActiveConnections(): Map<string, Date> {
+  if (!_sharedActiveConnections) {
+    _sharedActiveConnections = new Map();
+  }
+  return _sharedActiveConnections;
+}
+
+function getSharedBackgroundExecutions(): Map<string, { interval: NodeJS.Timeout, lastCheck: Date }> {
+  if (!_sharedBackgroundExecutions) {
+    _sharedBackgroundExecutions = new Map();
+  }
+  return _sharedBackgroundExecutions;
+}
+
+export class SshMCP {
+  private server: McpServer;
+  private sshService: SSHService;
+  private safetyCheckService: SafetyCheckService | null = null;
+  private outputCacheService: OutputCacheService;
+  private activeConnections: Map<string, Date>;
+  private backgroundExecutions: Map<string, { interval: NodeJS.Timeout, lastCheck: Date }>;
+  private pendingConfirmations: Map<string, { command: string, safetyResult: SafetyCheckResult }> = new Map();
+
+  constructor() {
+    // 使用共享单例服务——多个 MCP 客户端（SSE 模式）共享同一份状态
+    this.sshService = getSharedSshService();
+    this.safetyCheckService = getSharedSafetyCheckService();
+    this.outputCacheService = getSharedOutputCacheService();
+    this.activeConnections = getSharedActiveConnections();
+    this.backgroundExecutions = getSharedBackgroundExecutions();
+
+    // 初始化MCP服务器（每个客户端连接独立一个 McpServer 实例）
     this.server = new McpServer({
       name: "ssh-mcp",
       version: "1.0.0"
@@ -53,12 +98,13 @@ export class SshMCP {
 
     // 注册工具
     this.registerTools();
+  }
 
-    // 连接到标准输入/输出
-    const transport = new StdioServerTransport();
-    this.server.connect(transport).catch(err => {
-      console.error('连接MCP传输错误:', err);
-    });
+  /**
+   * 连接到指定的传输层（stdio / SSE 等）
+   */
+  async connectTransport(transport: any): Promise<void> {
+    await this.server.connect(transport);
   }
 
   /**
