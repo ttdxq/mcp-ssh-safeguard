@@ -47,6 +47,9 @@ export interface SSHConnection {
   client?: NodeSSH;
   tags?: string[];
   currentDirectory?: string;
+  poolKey?: string;  // 连接池键
+  poolIndex?: number; // 在池中的索引
+  createdAt?: Date;  // 连接创建时间
 }
 
 // 执行命令结果
@@ -153,6 +156,9 @@ export interface TerminalResizeEvent {
 export class SSHService {
   private static readonly MAX_FILE_TRANSFER_HISTORY = 200;
   private static readonly DEFAULT_HEALTH_CHECK_INTERVAL = 30 * 1000;
+  // 连接池：key = username@host:port, value = 连接数组
+  private connectionPools: Map<string, SSHConnection[]> = new Map();
+  // 快速查找表：connectionId (唯一ID) -> 连接
   private connections: Map<string, SSHConnection> = new Map();
   private db: Loki | null = null;
   private connectionCollection: Collection<any> | null = null;
@@ -162,10 +168,10 @@ export class SSHService {
   private serviceReadyPromise: Promise<void>;
   private isDocker: boolean = false;
   private allowInsecureDockerCredentialPersistence: boolean = false;
-  
+
   // 后台任务管理
   private backgroundTasks: Map<string, BackgroundTask> = new Map();
-  
+
   // SSH隧道管理
   private tunnels: Map<string, {
     config: TunnelConfig,
@@ -173,22 +179,25 @@ export class SSHService {
     connections: Set<net.Socket>,
     isActive: boolean
   }> = new Map();
-  
+
   // 事件发射器
   private eventEmitter: EventEmitter = new EventEmitter();
-  
+
   // 文件传输管理
   private fileTransfers: Map<string, FileTransferInfo> = new Map();
-  
+
   // 终端会话管理
   private terminalSessions: Map<string, TerminalSession> = new Map();
-  
+
   // 健康监控
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private static readonly HEALTH_CHECK_TIMEOUT = 10 * 1000;
   private static readonly MAX_RECONNECT_ATTEMPTS = 3;
   private static readonly RECONNECT_DELAY = 5 * 1000;
   private readonly healthCheckInterval: number;
+
+  // 连接池配置
+  private readonly MAX_POOL_SIZE = parseInt(process.env.SSH_POOL_SIZE || '10'); // 每个目标最大连接数
   
   constructor() {
     const { dataPath, warning } = resolveDataPath();
@@ -294,21 +303,16 @@ export class SSHService {
     }
   }
   
-  // 创建连接ID
-  private generateConnectionId(config: SSHConnectionConfig, name?: string, tags?: string[]): string {
-    const fingerprint = {
-      username: config.username,
-      host: config.host,
-      port: config.port || 22,
-      authMode: config.privateKey ? 'privateKey' : 'password',
-      privateKey: config.privateKey || '',
-      name: name || '',
-      tags: [...(tags || [])].sort()
-    };
+  // 创建连接池键（基于目标机器信息）
+  private generatePoolKey(config: SSHConnectionConfig): string {
+    return `${config.username}@${config.host}:${config.port || 22}`;
+  }
 
+  // 创建唯一连接ID（每次调用都生成新ID，确保连接独立）
+  private generateConnectionId(config: SSHConnectionConfig, name?: string, tags?: string[]): string {
     return crypto
       .createHash('md5')
-      .update(JSON.stringify(fingerprint))
+      .update(`${config.username}@${config.host}:${config.port || 22}:${Date.now()}:${crypto.randomBytes(4).toString('hex')}`)
       .digest('hex');
   }
   
@@ -404,34 +408,40 @@ export class SSHService {
   // 连接到SSH服务器
   public async connect(config: SSHConnectionConfig, name?: string, rememberPassword: boolean = false, tags?: string[]): Promise<SSHConnection> {
     await this.ensureReady();
-    
+
+    const poolKey = this.generatePoolKey(config);
     const connectionId = this.generateConnectionId(config, name, tags);
-    let connection = this.connections.get(connectionId);
     
-    // 如果已经连接，直接返回
-    if (connection && connection.status === ConnectionStatus.CONNECTED && connection.client) {
-      return connection;
+    // 获取或创建连接池
+    let pool = this.connectionPools.get(poolKey);
+    if (!pool) {
+      pool = [];
+      this.connectionPools.set(poolKey, pool);
     }
-    
-    // 如果存在连接但未连接，更新配置
-    if (connection) {
-      connection.config = {...connection.config, ...config};
-      connection.name = name || connection.name;
-      connection.tags = tags || connection.tags;
-      connection.status = ConnectionStatus.CONNECTING;
-    } else {
-      // 创建新连接
-      connection = {
-        id: connectionId,
-        name: name || `${config.username}@${config.host}`,
-        config,
-        status: ConnectionStatus.CONNECTING,
-        tags,
-        lastUsed: new Date()
-      };
-      this.connections.set(connectionId, connection);
+
+    // 检查池中是否有可用的已连接连接（复用策略）
+    const availableConnection = pool.find(
+      conn => conn.status === ConnectionStatus.CONNECTED && conn.client
+    );
+
+    // 如果有可用连接，直接返回（避免不必要的重复连接）
+    if (availableConnection) {
+      return availableConnection;
     }
-    
+
+    // 创建新连接
+    const connection: SSHConnection = {
+      id: connectionId,
+      name: name || `${config.username}@${config.host}`,
+      config,
+      status: ConnectionStatus.CONNECTING,
+      tags,
+      lastUsed: new Date(),
+      poolKey,
+      poolIndex: pool.length,
+      createdAt: new Date()
+    };
+
     try {
       // 如果没有提供密码，尝试从keytar获取
       if (!config.password && !config.privateKey) {
@@ -443,10 +453,10 @@ export class SSHService {
           config.passphrase = savedCredentials.passphrase;
         }
       }
-      
+
       // 创建SSH客户端
       const ssh = new NodeSSH();
-      
+
       // 连接选项
       const connectOptions = {
         host: config.host,
@@ -458,36 +468,44 @@ export class SSHService {
         keepaliveInterval: config.keepaliveInterval || 60000,
         readyTimeout: config.readyTimeout || parseInt(process.env.CONNECTION_TIMEOUT || '10000')
       };
-      
+
       // 连接
       await ssh.connect(connectOptions);
-      
+
       // 连接成功，更新状态
       connection.client = ssh;
       connection.status = ConnectionStatus.CONNECTED;
       connection.lastUsed = new Date();
       connection.lastError = undefined;
       connection.currentDirectory = await this.getCurrentDirectory(connectionId);
-      
+
+      // 将连接加入池中
+      pool.push(connection);
+      this.connections.set(connectionId, connection);
+
       // 如果配置了记住密码，保存凭据
       if (rememberPassword) {
         await this.saveCredentials(connectionId, config.password, config.passphrase);
       }
-      
+
       // 保存连接到数据库
       await this.saveConnection(connection);
-      
+
       return connection;
     } catch (error) {
       // 连接失败
       connection.status = ConnectionStatus.ERROR;
       connection.lastError = error instanceof Error ? error.message : String(error);
-      
+
+      // 将失败的连接也加入池中（便于后续重试）
+      pool.push(connection);
+      this.connections.set(connectionId, connection);
+
       // 如果配置了自动重连，尝试重连
       if (config.reconnect && config.reconnectTries && config.reconnectTries > 0) {
         this.scheduleReconnect(connectionId, config);
       }
-      
+
       throw error;
     }
   }
@@ -536,36 +554,146 @@ export class SSHService {
   }
   
   // 断开连接
-  public async disconnect(connectionId: string): Promise<boolean> {
+  public async disconnect(connectionId: string, disconnectAll: boolean = false): Promise<boolean> {
     const connection = this.connections.get(connectionId);
     if (!connection || !connection.client) {
       return false;
     }
-    
+
     try {
       // 断开SSH连接
       await connection.client.dispose();
-      
+
       // 更新状态
       connection.status = ConnectionStatus.DISCONNECTED;
       connection.client = undefined;
-      
+
+      // 如果 disconnectAll，断开池中所有连接
+      if (disconnectAll && connection.poolKey) {
+        const pool = this.connectionPools.get(connection.poolKey);
+        if (pool) {
+          for (const conn of pool) {
+            if (conn.id !== connectionId && conn.client && conn.status === ConnectionStatus.CONNECTED) {
+              try {
+                await conn.client.dispose();
+                conn.status = ConnectionStatus.DISCONNECTED;
+                conn.client = undefined;
+              } catch (err) {
+                console.error(`断开池中连接 ${conn.id} 时出错:`, err);
+              }
+            }
+          }
+        }
+      }
+
       return true;
     } catch (error) {
       console.error(`断开连接 ${connectionId} 时出错:`, error);
-      
+
       // 即使出错也要更新状态
       connection.status = ConnectionStatus.ERROR;
       connection.lastError = error instanceof Error ? error.message : String(error);
-      
+
       return false;
     }
+  }
+
+  // 断开指定目标的所有连接
+  public async disconnectAllByPoolKey(poolKey: string): Promise<number> {
+    const pool = this.connectionPools.get(poolKey);
+    if (!pool) {
+      return 0;
+    }
+
+    let disconnectedCount = 0;
+    for (const connection of pool) {
+      if (connection.client && connection.status === ConnectionStatus.CONNECTED) {
+        try {
+          await connection.client.dispose();
+          connection.status = ConnectionStatus.DISCONNECTED;
+          connection.client = undefined;
+          disconnectedCount++;
+        } catch (error) {
+          console.error(`断开连接 ${connection.id} 时出错:`, error);
+        }
+      }
+    }
+
+    return disconnectedCount;
+  }
+
+  // 清理连接池中的空闲连接（断开超过指定时间的连接）
+  public async cleanupIdleConnections(poolKey?: string, idleTimeoutMs: number = 30 * 60 * 1000): Promise<number> {
+    const now = new Date();
+    let cleanedCount = 0;
+
+    const poolsToClean = poolKey 
+      ? [[poolKey, this.connectionPools.get(poolKey)].filter(Boolean) as [string, SSHConnection[]]]
+      : Array.from(this.connectionPools.entries());
+
+    for (const [key, pool] of poolsToClean) {
+      for (const connection of pool) {
+        // 清理已断开或错误的连接
+        if (connection.status === ConnectionStatus.DISCONNECTED || 
+            connection.status === ConnectionStatus.ERROR) {
+          if (connection.client) {
+            try {
+              await connection.client.dispose();
+            } catch (error) {
+              console.error(`清理连接 ${connection.id} 时出错:`, error);
+            }
+            connection.client = undefined;
+          }
+          cleanedCount++;
+        }
+        // 清理长时间未使用的连接
+        else if (connection.lastUsed && 
+                 (now.getTime() - connection.lastUsed.getTime()) > idleTimeoutMs &&
+                 connection.status === ConnectionStatus.CONNECTED) {
+          try {
+            if (connection.client) {
+              await connection.client.dispose();
+              connection.client = undefined;
+            }
+            connection.status = ConnectionStatus.DISCONNECTED;
+            cleanedCount++;
+          } catch (error) {
+            console.error(`清理空闲连接 ${connection.id} 时出错:`, error);
+          }
+        }
+      }
+
+      // 移除池中所有已断开的连接
+      const activeConnections = pool.filter(c => 
+        c.status === ConnectionStatus.CONNECTED || c.status === ConnectionStatus.CONNECTING
+      );
+      
+      if (activeConnections.length < pool.length) {
+        this.connectionPools.set(key, activeConnections);
+        // 更新索引
+        activeConnections.forEach((conn, idx) => {
+          conn.poolIndex = idx;
+        });
+      }
+    }
+
+    return cleanedCount;
   }
   
   // 获取所有连接
   public async getAllConnections(): Promise<SSHConnection[]> {
     await this.ensureReady();
     return Array.from(this.connections.values());
+  }
+
+  // 获取连接池信息
+  public getConnectionPools(): Map<string, SSHConnection[]> {
+    return this.connectionPools;
+  }
+
+  // 获取指定池的所有连接
+  public getPoolConnections(poolKey: string): SSHConnection[] {
+    return this.connectionPools.get(poolKey) || [];
   }
   
   // 获取特定连接
@@ -1635,18 +1763,42 @@ export class SSHService {
   // 删除连接
   public async deleteConnection(connectionId: string): Promise<boolean> {
     await this.ensureReady();
-    
+
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
+      return false;
+    }
+
     // 断开连接
     await this.disconnect(connectionId);
-    
+
+    // 从连接池中移除
+    if (connection.poolKey) {
+      const pool = this.connectionPools.get(connection.poolKey);
+      if (pool) {
+        const index = pool.findIndex(c => c.id === connectionId);
+        if (index !== -1) {
+          pool.splice(index, 1);
+          // 更新池中剩余连接的索引
+          pool.forEach((conn, idx) => {
+            conn.poolIndex = idx;
+          });
+        }
+        // 如果池为空，删除池
+        if (pool.length === 0) {
+          this.connectionPools.delete(connection.poolKey);
+        }
+      }
+    }
+
+    // 从快速查找表中移除
+    this.connections.delete(connectionId);
+
     // 从数据库中删除
     if (this.connectionCollection) {
       this.connectionCollection.findAndRemove({ id: connectionId });
     }
-    
-    // 从内存中删除
-    this.connections.delete(connectionId);
-    
+
     // 删除凭据
     if (!this.isDocker) {
       try {
@@ -1662,7 +1814,7 @@ export class SSHService {
         this.credentialCollection.findAndRemove({ id: connectionId });
       }
     }
-    
+
     return true;
   }
   
@@ -2108,10 +2260,24 @@ export class SSHService {
   
   // 设置定期清理任务
   private setupCleanupTasks(): void {
+    // 每小时清理一次已完成的传输记录
     setInterval(() => {
       this.cleanupCompletedTransfers();
     }, 60 * 60 * 1000); // 1小时
-    
+
+    // 每30分钟清理一次空闲连接
+    setInterval(async () => {
+      try {
+        const cleaned = await this.cleanupIdleConnections();
+        if (cleaned > 0) {
+          console.log(`清理了 ${cleaned} 个空闲连接`);
+        }
+      } catch (error) {
+        console.error('清理空闲连接时出错:', error);
+      }
+    }, 30 * 60 * 1000); // 30分钟
+
+    // 每天清理一次长时间不活跃的资源
     setInterval(() => {
       this.cleanupInactiveResources();
     }, 24 * 60 * 60 * 1000); // 24小时
@@ -2269,27 +2435,39 @@ export class SSHService {
     for (const sessionId of this.terminalSessions.keys()) {
       await this.closeTerminalSession(sessionId);
     }
-    
+
     // 关闭所有隧道
     for (const tunnelId of this.tunnels.keys()) {
       await this.closeTunnel(tunnelId);
     }
-    
+
     // 停止所有后台任务
     for (const taskId of this.backgroundTasks.keys()) {
       await this.stopBackgroundTask(taskId);
     }
-    
-    // 断开所有连接
-    for (const [id, connection] of this.connections.entries()) {
-      if (connection.status === ConnectionStatus.CONNECTED && connection.client) {
-        await this.disconnect(id);
+
+    // 断开所有连接池中的连接
+    for (const [poolKey, pool] of this.connectionPools.entries()) {
+      for (const connection of pool) {
+        if (connection.status === ConnectionStatus.CONNECTED && connection.client) {
+          try {
+            await connection.client.dispose();
+            connection.status = ConnectionStatus.DISCONNECTED;
+            connection.client = undefined;
+          } catch (error) {
+            console.error(`关闭连接 ${connection.id} 时出错:`, error);
+          }
+        }
       }
     }
-    
+
+    // 清空连接池和快速查找表
+    this.connectionPools.clear();
+    this.connections.clear();
+
     // 保存数据库
     if (this.db) {
       this.db.saveDatabase();
     }
   }
-} 
+}

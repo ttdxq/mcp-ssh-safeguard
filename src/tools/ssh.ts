@@ -182,18 +182,75 @@ export class SshMCP {
       info += `标签: ${connection.tags.join(', ')}\n`;
     }
     
+    if (connection.poolKey) {
+      info += `连接池: ${connection.poolKey}\n`;
+    }
+
+    if (connection.createdAt) {
+      info += `创建时间: ${connection.createdAt.toLocaleString()}\n`;
+    }
+
     if (this.activeConnections.has(connection.id)) {
       const lastActive = this.activeConnections.get(connection.id);
       if (lastActive) {
         info += `活跃度: ${this.formatTimeDifference(lastActive)}\n`;
       }
     }
-    
+
     if (this.backgroundExecutions.has(connection.id)) {
       info += `后台任务: 活跃中\n`;
     }
-    
+
     return info;
+  }
+
+  /**
+   * 格式化连接池信息
+   */
+  private formatConnectionPoolInfo(): string {
+    const pools = this.sshService.getConnectionPools();
+    if (pools.size === 0) {
+      return '当前没有连接池';
+    }
+
+    let output = '连接池状态:\n\n';
+    for (const [poolKey, connections] of pools.entries()) {
+      const activeConnections = connections.filter(c => c.status === ConnectionStatus.CONNECTED);
+      const totalConnections = connections.length;
+      
+      output += `📦 池: ${poolKey}\n`;
+      output += `   总连接数: ${totalConnections}\n`;
+      output += `   活跃连接: ${activeConnections.length}\n`;
+      output += `   连接详情:\n`;
+      
+      connections.forEach((conn, idx) => {
+        const statusEmoji = {
+          [ConnectionStatus.CONNECTED]: '🟢',
+          [ConnectionStatus.CONNECTING]: '🟡',
+          [ConnectionStatus.DISCONNECTED]: '⚪',
+          [ConnectionStatus.RECONNECTING]: '🟠',
+          [ConnectionStatus.ERROR]: '🔴'
+        };
+        const statusText = {
+          [ConnectionStatus.CONNECTED]: '已连接',
+          [ConnectionStatus.CONNECTING]: '连接中',
+          [ConnectionStatus.DISCONNECTED]: '已断开',
+          [ConnectionStatus.RECONNECTING]: '重连中',
+          [ConnectionStatus.ERROR]: '错误'
+        };
+        
+        output += `   ${idx + 1}. ${statusEmoji[conn.status as ConnectionStatus]} ID: ${conn.id.substring(0, 8)}... | 状态: ${statusText[conn.status as ConnectionStatus]}\n`;
+        if (conn.createdAt) {
+          output += `      创建时间: ${conn.createdAt.toLocaleString()}\n`;
+        }
+        if (this.activeConnections.has(conn.id)) {
+          output += `      最后活跃: ${this.formatTimeDifference(this.activeConnections.get(conn.id)!)}\n`;
+        }
+      });
+      output += '\n';
+    }
+
+    return output;
   }
   
   /**
@@ -470,9 +527,10 @@ export class SshMCP {
       "disconnect",
       "Disconnects an active SSH connection.",
       {
-        connectionId: z.string()
+        connectionId: z.string(),
+        disconnectAll: z.boolean().optional().default(false)
       },
-      async ({ connectionId }) => {
+      async ({ connectionId, disconnectAll }) => {
         try {
           const connection = this.sshService.getConnection(connectionId);
           if (!connection) {
@@ -484,22 +542,25 @@ export class SshMCP {
               isError: true
             };
           }
-          
+
           // 如果有后台任务，先停止
           if (this.backgroundExecutions.has(connectionId)) {
             this.stopBackgroundExecution(connectionId);
           }
-          
-          const success = await this.sshService.disconnect(connectionId);
-          
+
+          const success = await this.sshService.disconnect(connectionId, disconnectAll);
+
           // 删除活跃连接记录
           this.activeConnections.delete(connectionId);
-          
+
           if (success) {
+            const message = disconnectAll 
+              ? `已成功断开连接到 ${connection.config.host} 的所有会话`
+              : `已成功断开连接 ${connection.name || connectionId}`;
             return {
               content: [{
                 type: "text",
-                text: `已成功断开连接 ${connection.name || connectionId}`
+                text: message
               }]
             };
           } else {
@@ -531,7 +592,7 @@ export class SshMCP {
       async () => {
         try {
           const connections = await this.sshService.getAllConnections();
-          
+
           if (connections.length === 0) {
             return {
               content: [{
@@ -540,11 +601,11 @@ export class SshMCP {
               }]
             };
           }
-          
-          const formattedConnections = connections.map(conn => 
+
+          const formattedConnections = connections.map(conn =>
             this.formatConnectionInfo(conn)
           ).join("\n---\n");
-          
+
           return {
             content: [{
               type: "text",
@@ -556,6 +617,32 @@ export class SshMCP {
             content: [{
               type: "text",
               text: `获取连接列表出错: ${error instanceof Error ? error.message : String(error)}`
+            }],
+            isError: true
+          };
+        }
+      }
+    );
+
+    // 获取连接池状态
+    this.server.tool(
+      "listConnectionPools",
+      "Lists all SSH connection pools and their status.",
+      {},
+      async () => {
+        try {
+          const poolInfo = this.formatConnectionPoolInfo();
+          return {
+            content: [{
+              type: "text",
+              text: poolInfo
+            }]
+          };
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `获取连接池状态出错: ${error instanceof Error ? error.message : String(error)}`
             }],
             isError: true
           };
