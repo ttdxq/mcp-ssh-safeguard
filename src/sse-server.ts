@@ -20,20 +20,94 @@
  */
 
 import * as http from 'http';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { SshMCP } from './tools/ssh.js';
 import { config } from 'dotenv';
+import { ReliableSSEServerTransport, type ReliableSseLogEvent } from './reliable-sse-server-transport.js';
 
 config();
 
 const PORT = parseInt(process.env.MCP_SSE_PORT || '3001', 10);
 const HOST = process.env.MCP_SSE_HOST || '127.0.0.1';
+const SSE_HEARTBEAT_INTERVAL_MS = parseInt(process.env.MCP_SSE_HEARTBEAT_INTERVAL || '15000', 10);
+const SSE_WRITE_TIMEOUT_MS = parseInt(process.env.MCP_SSE_WRITE_TIMEOUT || '5000', 10);
+
+type SseLogLanguage = 'zh' | 'en';
+type SseLogLanguageMode = SseLogLanguage | 'auto';
+type SseLogEvent =
+  | 'session-open'
+  | 'session-cleanup'
+  | 'heartbeat-sent'
+  | 'http-message-post'
+  | ReliableSseLogEvent;
+
+const SSE_LOG_LANGUAGE_MODE = normalizeSseLogLanguageMode(process.env.MCP_SSE_LOG_LANGUAGE);
+
+const SSE_LOG_EVENT_LABELS: Record<SseLogEvent, Record<SseLogLanguage, string>> = {
+  'session-open': { zh: '会话已建立', en: 'session-open' },
+  'session-cleanup': { zh: '会话清理', en: 'session-cleanup' },
+  'heartbeat-sent': { zh: '心跳已发送', en: 'heartbeat-sent' },
+  'http-message-post': { zh: '收到消息请求', en: 'http-message-post' },
+  'transport-started': { zh: '传输已启动', en: 'transport-started' },
+  'message-received': { zh: '已接收消息', en: 'message-received' },
+  'message-accepted': { zh: '消息已接受', en: 'message-accepted' },
+  'message-sent': { zh: '消息已发送', en: 'message-sent' },
+  'message-send-failed': { zh: '消息发送失败', en: 'message-send-failed' },
+};
 
 // 活跃的 SSE 传输会话
 const activeTransports = new Map<string, {
-  transport: SSEServerTransport;
+  transport: ReliableSSEServerTransport;
   sshMCP: SshMCP;
+  language: SseLogLanguage;
 }>();
+
+function formatLogDetails(details: Record<string, string | number | boolean | null | undefined>): string {
+  const parts = Object.entries(details)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`);
+
+  return parts.length > 0 ? ` ${parts.join(' ')}` : '';
+}
+
+function normalizeSseLogLanguageMode(value: string | undefined): SseLogLanguageMode {
+  const normalized = value?.trim().toLowerCase();
+
+  if (!normalized || normalized === 'auto') {
+    return 'auto';
+  }
+
+  if (normalized === 'zh' || normalized === 'en') {
+    return normalized;
+  }
+
+  console.error(`[SSE] Invalid MCP_SSE_LOG_LANGUAGE=${JSON.stringify(value)}, falling back to auto`);
+  return 'auto';
+}
+
+function detectSseLogLanguage(acceptLanguageHeader: string | string[] | undefined): SseLogLanguage {
+  if (SSE_LOG_LANGUAGE_MODE === 'zh' || SSE_LOG_LANGUAGE_MODE === 'en') {
+    return SSE_LOG_LANGUAGE_MODE;
+  }
+
+  const value = Array.isArray(acceptLanguageHeader)
+    ? acceptLanguageHeader.join(',')
+    : acceptLanguageHeader;
+
+  if (!value) {
+    return 'en';
+  }
+
+  return /(^|,|;)\s*zh(?:-|$)/i.test(value) ? 'zh' : 'en';
+}
+
+function logSse(
+  event: SseLogEvent,
+  language: SseLogLanguage,
+  details: Record<string, string | number | boolean | null | undefined> = {},
+): void {
+  const eventLabel = SSE_LOG_EVENT_LABELS[event][language];
+  console.error(`[SSE] ${eventLabel}${formatLogDetails(details)}`);
+}
 
 /**
  * 从请求中读取完整 body（JSON 字符串）
@@ -70,25 +144,105 @@ const server = http.createServer(async (req, res) => {
 
   // ── GET /sse —— 建立 SSE 长连接 ──
   if (req.method === 'GET' && req.url?.startsWith('/sse')) {
+    let pendingSessionId: string | null = null;
+    const preferredLanguage = detectSseLogLanguage(req.headers['accept-language']);
+
     try {
+      req.socket.setTimeout(0);
+      req.socket.setNoDelay(true);
+      res.socket?.setTimeout(0);
+      res.socket?.setNoDelay(true);
+
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+
       const sshMCP = new SshMCP();
-      const transport = new SSEServerTransport('/messages', res);
+      const transport = new ReliableSSEServerTransport({
+        endpoint: '/messages',
+        response: res,
+        writeTimeoutMs: SSE_WRITE_TIMEOUT_MS,
+        onActivity: () => {
+          lastActivityAt = Date.now();
+        },
+        onLog: (event, details) => {
+          logSse(event, preferredLanguage, details);
+        },
+      });
       const sessionId = transport.sessionId;
+      pendingSessionId = sessionId;
+      const connectedAt = Date.now();
+      let lastActivityAt = connectedAt;
+      let cleanedUp = false;
+      let heartbeatTimer: NodeJS.Timeout | null = null;
 
-      activeTransports.set(sessionId, { transport, sshMCP });
-
-      console.error(`[SSE] 新客户端连接 sessionId=${sessionId}，当前活跃连接: ${activeTransports.size}`);
-
-      // 客户端断开时清理
-      const originalOnClose = transport.onclose?.bind(transport);
-      transport.onclose = () => {
+      const cleanupSession = (reason: string) => {
+        if (cleanedUp) {
+          return;
+        }
+        cleanedUp = true;
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
         activeTransports.delete(sessionId);
-        console.error(`[SSE] 客户端断开 sessionId=${sessionId}，剩余活跃连接: ${activeTransports.size}`);
-        originalOnClose?.();
+        const connectionDurationMs = Date.now() - connectedAt;
+        const idleForMs = Date.now() - lastActivityAt;
+        logSse('session-cleanup', preferredLanguage, {
+          sessionId,
+          reason,
+          connectionDurationMs,
+          idleForMs,
+          activeConnections: activeTransports.size,
+        });
       };
 
+      const writeHeartbeat = () => {
+        if (cleanedUp || res.writableEnded || res.destroyed) {
+          cleanupSession('heartbeat-detected-closed-socket');
+          return;
+        }
+
+        try {
+          res.write(`: ping ${Date.now()}\n\n`);
+          lastActivityAt = Date.now();
+          logSse('heartbeat-sent', preferredLanguage, {
+            sessionId,
+            activeConnections: activeTransports.size,
+          });
+        } catch (error) {
+          console.error(`[SSE] heartbeat 写入失败 sessionId=${sessionId}:`, error);
+          cleanupSession('heartbeat-write-failed');
+        }
+      };
+
+      activeTransports.set(sessionId, { transport, sshMCP, language: preferredLanguage });
+
+      logSse('session-open', preferredLanguage, {
+        sessionId,
+        activeConnections: activeTransports.size,
+      });
+
+      // 客户端断开时清理，避免覆盖 SDK 内部 onclose 行为
+      req.once('aborted', () => cleanupSession('request-aborted'));
+      res.once('close', () => cleanupSession('response-close'));
+      res.once('finish', () => cleanupSession('response-finish'));
+      res.once('error', (error) => {
+        console.error(`[SSE] response error sessionId=${sessionId}:`, error);
+        cleanupSession('response-error');
+      });
+
       await sshMCP.connectTransport(transport);
+      if (cleanedUp || res.writableEnded || res.destroyed) {
+        cleanupSession('transport-connected-after-close');
+        return;
+      }
+
+      heartbeatTimer = setInterval(writeHeartbeat, SSE_HEARTBEAT_INTERVAL_MS);
     } catch (err) {
+      if (pendingSessionId) {
+        activeTransports.delete(pendingSessionId);
+      }
       console.error('[SSE] 建立连接失败:', err);
       if (!res.headersSent) {
         res.writeHead(500);
@@ -118,6 +272,15 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       // 将解析后的 JSON 传入 handlePostMessage
       const parsed = JSON.parse(body);
+      const parsedMessage = parsed as { id?: string | number; method?: string; params?: { name?: string } };
+
+      logSse('http-message-post', entry.language, {
+        sessionId,
+        messageId: parsedMessage.id !== undefined ? String(parsedMessage.id) : undefined,
+        method: parsedMessage.method,
+        toolName: parsedMessage.method === 'tools/call' ? parsedMessage.params?.name : undefined,
+      });
+
       await entry.transport.handlePostMessage(req, res, parsed);
     } catch (err) {
       console.error('[SSE] 处理消息失败:', err);
@@ -171,18 +334,25 @@ function gracefulShutdown(signal: string) {
   setTimeout(() => process.exit(1), 5000);
 }
 
+function shutdownOnFatalError(reason: string, error: unknown): void {
+  console.error(reason, error);
+  if (isShuttingDown) {
+    process.exit(1);
+    return;
+  }
+
+  gracefulShutdown('fatal error');
+}
+
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 process.on('uncaughtException', (err) => {
-  console.error('[SSE] 未捕获的异常:', err);
-  if (isShuttingDown) {
-    process.exit(1);
-  }
+  shutdownOnFatalError('[SSE] 未捕获的异常，准备退出:', err);
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('[SSE] 未处理的 Promise 拒绝:', reason);
+  shutdownOnFatalError('[SSE] 未处理的 Promise 拒绝，准备退出:', reason);
 });
 
 server.listen(PORT, HOST, () => {

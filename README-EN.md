@@ -325,6 +325,12 @@ npm run mcp:sse
 
 # Customize port and bind address (default: 127.0.0.1:3001)
 MCP_SSE_PORT=4000 MCP_SSE_HOST=0.0.0.0 npm run mcp:sse
+
+# Customize heartbeat and write timeout
+MCP_SSE_HEARTBEAT_INTERVAL=15000 MCP_SSE_WRITE_TIMEOUT=5000 npm run mcp:sse
+
+# Force SSE log language (zh | en | auto)
+MCP_SSE_LOG_LANGUAGE=zh npm run mcp:sse
 ```
 
 After startup, you'll see:
@@ -359,10 +365,31 @@ Or create a `.env` file in the project root:
 
 ```env
 MCP_SSE_PORT=3001
+MCP_SSE_HEARTBEAT_INTERVAL=15000
+MCP_SSE_WRITE_TIMEOUT=5000
+MCP_SSE_LOG_LANGUAGE=auto
 OPENAI_API_KEY=your-key
 OPENAI_API_BASE=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1-mini
 SAFETY_CHECK_ENABLED=true
+```
+
+### SSE Runtime Notes
+
+- `MCP_SSE_HEARTBEAT_INTERVAL`: SSE heartbeat interval in milliseconds. Default: `15000`
+- `MCP_SSE_WRITE_TIMEOUT`: timeout for waiting on `drain` during SSE writes, in milliseconds. Default: `5000`
+- `MCP_SSE_LOG_LANGUAGE`: SSE log language. Supported values: `zh`, `en`, `auto`. Default: `auto`
+- The SSE server now sends heartbeat comments for idle connections to reduce silent disconnects during long-blocking command execution
+- SSE writes now handle Node.js backpressure; if the client is too slow or the connection is unhealthy, the failure is recorded in logs
+- When `MCP_SSE_LOG_LANGUAGE=zh` or `en`, SSE log event names are forced to that language
+- When `MCP_SSE_LOG_LANGUAGE=auto` (default), SSE log event names are selected from the client's `Accept-Language`: Chinese clients receive Chinese event names, non-Chinese clients receive English event names
+
+Example logs:
+
+```text
+[SSE] session-open sessionId="..." activeConnections=1
+[SSE] heartbeat-sent sessionId="..." activeConnections=1
+[SSE] message-sent sessionId="..." messageId="12" processingTimeMs=1834 hasError=false
 ```
 
 ### Multiple Agents Connecting Simultaneously

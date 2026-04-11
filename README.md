@@ -325,6 +325,12 @@ npm run mcp:sse
 
 # 自定义端口和绑定地址（默认 127.0.0.1:3001）
 MCP_SSE_PORT=4000 MCP_SSE_HOST=0.0.0.0 npm run mcp:sse
+
+# 自定义心跳与写回超时
+MCP_SSE_HEARTBEAT_INTERVAL=15000 MCP_SSE_WRITE_TIMEOUT=5000 npm run mcp:sse
+
+# 强制指定 SSE 日志语言（zh | en | auto）
+MCP_SSE_LOG_LANGUAGE=zh npm run mcp:sse
 ```
 
 启动后会看到：
@@ -359,10 +365,31 @@ OPENAI_API_KEY=your-key OPENAI_API_BASE=https://api.openai.com/v1 OPENAI_MODEL=g
 
 ```env
 MCP_SSE_PORT=3001
+MCP_SSE_HEARTBEAT_INTERVAL=15000
+MCP_SSE_WRITE_TIMEOUT=5000
+MCP_SSE_LOG_LANGUAGE=auto
 OPENAI_API_KEY=your-key
 OPENAI_API_BASE=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1-mini
 SAFETY_CHECK_ENABLED=true
+```
+
+### SSE 运行时说明
+
+- `MCP_SSE_HEARTBEAT_INTERVAL`：SSE 心跳间隔，单位毫秒，默认 `15000`
+- `MCP_SSE_WRITE_TIMEOUT`：SSE 写回等待 `drain` 的超时，单位毫秒，默认 `5000`
+- `MCP_SSE_LOG_LANGUAGE`：SSE 日志语言，支持 `zh`、`en`、`auto`，默认 `auto`
+- SSE 服务器会为长时间空闲的连接持续发送心跳，降低长阻塞命令结果回传时因链路静默而断开的概率
+- SSE 写回现在会处理 Node.js 的 backpressure；如果客户端过慢或连接异常，会在日志中记录发送失败
+- 当 `MCP_SSE_LOG_LANGUAGE=zh` 或 `en` 时，SSE 日志事件名会强制使用对应语言
+- 当 `MCP_SSE_LOG_LANGUAGE=auto`（默认）时，SSE 日志事件名会根据客户端 `Accept-Language` 自动切换：中文客户端输出中文事件名，非中文客户端输出英文事件名
+
+示例日志：
+
+```text
+[SSE] 会话已建立 sessionId="..." activeConnections=1
+[SSE] 心跳已发送 sessionId="..." activeConnections=1
+[SSE] 消息已发送 sessionId="..." messageId="12" processingTimeMs=1834 hasError=false
 ```
 
 ### 多 Agent 同时连接
