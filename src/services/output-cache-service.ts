@@ -1,3 +1,5 @@
+import { randomUUID } from 'crypto';
+
 export interface CachedOutput {
   id: string;
   command: string;
@@ -127,7 +129,7 @@ export class OutputCacheService {
    * 生成缓存ID
    */
   private generateCacheId(): string {
-    return `cache_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    return `cache_${randomUUID()}`;
   }
 
   /**

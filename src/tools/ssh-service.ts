@@ -151,6 +151,8 @@ export interface TerminalResizeEvent {
 
 // 服务类
 export class SSHService {
+  private static readonly MAX_FILE_TRANSFER_HISTORY = 200;
+  private static readonly DEFAULT_HEALTH_CHECK_INTERVAL = 30 * 1000;
   private connections: Map<string, SSHConnection> = new Map();
   private db: Loki | null = null;
   private connectionCollection: Collection<any> | null = null;
@@ -183,10 +185,10 @@ export class SSHService {
   
   // 健康监控
   private healthCheckTimer: NodeJS.Timeout | null = null;
-  private static readonly HEALTH_CHECK_INTERVAL = 30 * 1000;
   private static readonly HEALTH_CHECK_TIMEOUT = 10 * 1000;
   private static readonly MAX_RECONNECT_ATTEMPTS = 3;
   private static readonly RECONNECT_DELAY = 5 * 1000;
+  private readonly healthCheckInterval: number;
   
   constructor() {
     const { dataPath, warning } = resolveDataPath();
@@ -201,6 +203,11 @@ export class SSHService {
     if (this.isDocker && !this.allowInsecureDockerCredentialPersistence) {
       console.warn('Docker mode disables remembered passwords by default; set ALLOW_INSECURE_DOCKER_CREDENTIALS=true to restore the old plaintext behavior.');
     }
+
+    const configuredHealthCheckInterval = parseInt(process.env.HEALTH_CHECK_INTERVAL || '', 10);
+    this.healthCheckInterval = Number.isFinite(configuredHealthCheckInterval) && configuredHealthCheckInterval > 0
+      ? configuredHealthCheckInterval
+      : SSHService.DEFAULT_HEALTH_CHECK_INTERVAL;
     
     // 创建数据目录（如果不存在）
     if (!fs.existsSync(this.dataPath)) {
@@ -288,10 +295,20 @@ export class SSHService {
   }
   
   // 创建连接ID
-  private generateConnectionId(config: SSHConnectionConfig): string {
+  private generateConnectionId(config: SSHConnectionConfig, name?: string, tags?: string[]): string {
+    const fingerprint = {
+      username: config.username,
+      host: config.host,
+      port: config.port || 22,
+      authMode: config.privateKey ? 'privateKey' : 'password',
+      privateKey: config.privateKey || '',
+      name: name || '',
+      tags: [...(tags || [])].sort()
+    };
+
     return crypto
       .createHash('md5')
-      .update(`${config.username}@${config.host}:${config.port || 22}`)
+      .update(JSON.stringify(fingerprint))
       .digest('hex');
   }
   
@@ -388,7 +405,7 @@ export class SSHService {
   public async connect(config: SSHConnectionConfig, name?: string, rememberPassword: boolean = false, tags?: string[]): Promise<SSHConnection> {
     await this.ensureReady();
     
-    const connectionId = this.generateConnectionId(config);
+    const connectionId = this.generateConnectionId(config, name, tags);
     let connection = this.connections.get(connectionId);
     
     // 如果已经连接，直接返回
@@ -555,6 +572,10 @@ export class SSHService {
   public getConnection(connectionId: string): SSHConnection | undefined {
     return this.connections.get(connectionId);
   }
+
+  public async waitUntilReady(): Promise<void> {
+    await this.ensureReady();
+  }
   
   // 执行命令
   public async executeCommand(connectionId: string, command: string, options?: { cwd?: string, timeout?: number }): Promise<CommandResult> {
@@ -584,7 +605,7 @@ export class SSHService {
       if (sudoPassword) {
         const result = await this.executeSudoCommand(connection, command, sudoPassword, options);
 
-        if (command.trim().startsWith('cd ')) {
+        if (this.commandMayChangeDirectory(command)) {
           connection.currentDirectory = await this.getCurrentDirectory(connectionId);
         }
 
@@ -609,7 +630,7 @@ export class SSHService {
       );
       
       // 更新当前目录（如果是cd命令）
-      if (command.trim().startsWith('cd ')) {
+      if (this.commandMayChangeDirectory(command)) {
         connection.currentDirectory = await this.getCurrentDirectory(connectionId);
       }
       
@@ -728,7 +749,8 @@ export class SSHService {
   }
 
   private isSudoCommand(command: string): boolean {
-    return command.trim().startsWith('sudo ') || command.includes(' sudo ');
+    const sudoPrefixPattern = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S+)\s+)*sudo(?=\s|$)/;
+    return this.getTopLevelCommandSegments(command).some(({ text }) => sudoPrefixPattern.test(text));
   }
 
   private getRawSshClient(connection: SSHConnection): SSHClient {
@@ -746,11 +768,98 @@ export class SSHService {
     }
 
     const escapedCwd = cwd.replace(/'/g, `'"'"'`);
-    return `cd '${escapedCwd}' && ${command}`;
+    return `cd -- '${escapedCwd}' && ${command}`;
   }
 
   private normalizeSudoCommand(command: string): string {
-    return command.replace(/\bsudo\b/g, 'sudo -S -p ""');
+    const sudoPrefixPattern = /^(\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S+)\s+)*)sudo(?=\s|$)/;
+    const segments = this.getTopLevelCommandSegments(command);
+
+    if (segments.length === 0) {
+      return command;
+    }
+
+    let normalized = '';
+    let lastIndex = 0;
+
+    for (const segment of segments) {
+      normalized += command.slice(lastIndex, segment.start);
+      normalized += segment.text.replace(sudoPrefixPattern, '$1sudo -S -p ""');
+      lastIndex = segment.end;
+    }
+
+    normalized += command.slice(lastIndex);
+    return normalized;
+  }
+
+  private commandMayChangeDirectory(command: string): boolean {
+    const cdPrefixPattern = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S+)\s+)*cd(?=\s|$)/;
+    return this.getTopLevelCommandSegments(command).some(({ text }) => cdPrefixPattern.test(text));
+  }
+
+  private getTopLevelCommandSegments(command: string): Array<{ start: number; end: number; text: string }> {
+    const segments: Array<{ start: number; end: number; text: string }> = [];
+    let segmentStart = 0;
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+    let escaped = false;
+
+    const pushSegment = (end: number) => {
+      const text = command.slice(segmentStart, end);
+      if (text.trim()) {
+        segments.push({ start: segmentStart, end, text });
+      }
+    };
+
+    for (let i = 0; i < command.length; i++) {
+      const char = command[i];
+      const next = command[i + 1];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\' && !inSingleQuote) {
+        escaped = true;
+        continue;
+      }
+
+      if (char === "'" && !inDoubleQuote) {
+        inSingleQuote = !inSingleQuote;
+        continue;
+      }
+
+      if (char === '"' && !inSingleQuote) {
+        inDoubleQuote = !inDoubleQuote;
+        continue;
+      }
+
+      if (inSingleQuote || inDoubleQuote) {
+        continue;
+      }
+
+      if (char === ';' || char === '\n') {
+        pushSegment(i);
+        segmentStart = i + 1;
+        continue;
+      }
+
+      if ((char === '&' && next === '&') || (char === '|' && next === '|')) {
+        pushSegment(i);
+        segmentStart = i + 2;
+        i++;
+        continue;
+      }
+
+      if (char === '&' || char === '|') {
+        pushSegment(i);
+        segmentStart = i + 1;
+      }
+    }
+
+    pushSegment(command.length);
+    return segments;
   }
 
   private async executeSudoCommand(
@@ -1113,7 +1222,7 @@ export class SSHService {
       };
       
       // 保存传输信息
-      this.fileTransfers.set(transferId, transferInfo);
+      this.storeFileTransfer(transferInfo);
       
       // 使用SFTPStream上传文件
       const sftp = await connection.client.requestSFTP();
@@ -1128,6 +1237,44 @@ export class SSHService {
         
         // 创建写入流
         const writeStream = sftp.createWriteStream(remotePath);
+
+        let settled = false;
+
+        const cleanup = () => {
+          readStream.removeAllListeners('data');
+          readStream.removeAllListeners('error');
+          writeStream.removeAllListeners('error');
+          writeStream.removeAllListeners('close');
+        };
+
+        const fail = (err: Error) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          transferInfo.status = 'failed';
+          transferInfo.error = err.message;
+          transferInfo.endTime = new Date();
+          this.eventEmitter.emit('transfer-error', transferInfo);
+          readStream.destroy();
+          writeStream.destroy();
+          reject(err);
+        };
+
+        const succeed = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          transferInfo.status = 'completed';
+          transferInfo.progress = 100;
+          transferInfo.bytesTransferred = stats.size;
+          transferInfo.endTime = new Date();
+          this.eventEmitter.emit('transfer-complete', transferInfo);
+          resolve();
+        };
         
         // 跟踪传输的字节数
         let bytesTransferred = 0;
@@ -1146,30 +1293,16 @@ export class SSHService {
         
         // 处理错误
         readStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          reject(err);
+          fail(err);
         });
         
         writeStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          readStream.destroy();
-          reject(err);
+          fail(err);
         });
         
         // 处理完成
         writeStream.on('close', () => {
-          transferInfo.status = 'completed';
-          transferInfo.progress = 100;
-          transferInfo.bytesTransferred = stats.size;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-complete', transferInfo);
-          resolve();
+          succeed();
         });
         
         // 连接流
@@ -1207,7 +1340,7 @@ export class SSHService {
         endTime: new Date()
       };
       
-      this.fileTransfers.set(transferId, failedTransfer);
+      this.storeFileTransfer(failedTransfer);
       this.eventEmitter.emit('transfer-error', failedTransfer);
       
       return failedTransfer;
@@ -1262,7 +1395,7 @@ export class SSHService {
       };
       
       // 保存传输信息
-      this.fileTransfers.set(transferId, transferInfo);
+      this.storeFileTransfer(transferInfo);
       
       await new Promise<void>((resolve, reject) => {
         // 更新传输状态
@@ -1274,6 +1407,44 @@ export class SSHService {
         
         // 创建写入流
         const writeStream = fs.createWriteStream(localPath);
+
+        let settled = false;
+
+        const cleanup = () => {
+          readStream.removeAllListeners('data');
+          readStream.removeAllListeners('error');
+          writeStream.removeAllListeners('error');
+          writeStream.removeAllListeners('close');
+        };
+
+        const fail = (err: Error) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          transferInfo.status = 'failed';
+          transferInfo.error = err.message;
+          transferInfo.endTime = new Date();
+          this.eventEmitter.emit('transfer-error', transferInfo);
+          readStream.destroy();
+          writeStream.destroy();
+          reject(err);
+        };
+
+        const succeed = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          transferInfo.status = 'completed';
+          transferInfo.progress = 100;
+          transferInfo.bytesTransferred = stats.size;
+          transferInfo.endTime = new Date();
+          this.eventEmitter.emit('transfer-complete', transferInfo);
+          resolve();
+        };
         
         // 跟踪传输的字节数
         let bytesTransferred = 0;
@@ -1292,31 +1463,16 @@ export class SSHService {
         
         // 处理错误
         readStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          writeStream.close();
-          reject(err);
+          fail(err);
         });
         
         writeStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          readStream.destroy();
-          reject(err);
+          fail(err);
         });
         
         // 处理完成
         writeStream.on('close', () => {
-          transferInfo.status = 'completed';
-          transferInfo.progress = 100;
-          transferInfo.bytesTransferred = stats.size;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-complete', transferInfo);
-          resolve();
+          succeed();
         });
         
         // 连接流
@@ -1354,7 +1510,7 @@ export class SSHService {
         endTime: new Date()
       };
       
-      this.fileTransfers.set(transferId, failedTransfer);
+      this.storeFileTransfer(failedTransfer);
       this.eventEmitter.emit('transfer-error', failedTransfer);
       
       return failedTransfer;
@@ -1410,6 +1566,30 @@ export class SSHService {
   // 获取所有传输
   public getAllTransfers(): FileTransferInfo[] {
     return Array.from(this.fileTransfers.values());
+  }
+
+  private storeFileTransfer(transferInfo: FileTransferInfo): void {
+    this.fileTransfers.set(transferInfo.id, transferInfo);
+    this.pruneFileTransfers();
+  }
+
+  private pruneFileTransfers(): void {
+    if (this.fileTransfers.size <= SSHService.MAX_FILE_TRANSFER_HISTORY) {
+      return;
+    }
+
+    const removableTransfers = Array.from(this.fileTransfers.entries())
+      .filter(([, transfer]) => transfer.status === 'completed' || transfer.status === 'failed')
+      .sort(([, a], [, b]) => {
+        const aTime = a.endTime?.getTime() ?? a.startTime.getTime();
+        const bTime = b.endTime?.getTime() ?? b.startTime.getTime();
+        return aTime - bTime;
+      });
+
+    while (this.fileTransfers.size > SSHService.MAX_FILE_TRANSFER_HISTORY && removableTransfers.length > 0) {
+      const [transferId] = removableTransfers.shift()!;
+      this.fileTransfers.delete(transferId);
+    }
   }
   
   // 注册进度回调
@@ -1940,7 +2120,7 @@ export class SSHService {
       this.performHealthCheck().catch((err: unknown) => {
         console.error('健康检查出错:', err);
       });
-    }, SSHService.HEALTH_CHECK_INTERVAL);
+    }, this.healthCheckInterval);
   }
   
   // 清理已完成的传输记录
@@ -1955,6 +2135,8 @@ export class SSHService {
         this.fileTransfers.delete(id);
       }
     }
+
+    this.pruneFileTransfers();
     
     console.error(`已清理完成的文件传输记录，当前剩余: ${this.fileTransfers.size}`);
   }
@@ -1989,14 +2171,13 @@ export class SSHService {
       }
 
       try {
-        const result = await Promise.race([
-          this.executeCommand(connectionId, 'echo __mcp_ssh_health_check__', {
-            timeout: SSHService.HEALTH_CHECK_TIMEOUT
-          }),
-          new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error('health check timeout')), SSHService.HEALTH_CHECK_TIMEOUT);
-          })
-        ]);
+        const result = await this.executeCommand(connectionId, 'echo __mcp_ssh_health_check__', {
+          timeout: SSHService.HEALTH_CHECK_TIMEOUT
+        });
+
+        if (result.code !== 0) {
+          throw new Error(result.stderr || 'health check command failed');
+        }
 
         if (!result.stdout.includes('__mcp_ssh_health_check__')) {
           throw new Error('health check returned unexpected output');

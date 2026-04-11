@@ -66,6 +66,36 @@ export class ProcessManager {
     return false;
   }
 
+  private tryCreateLockFile(): boolean {
+    fs.writeFileSync(
+      LOCK_FILE,
+      JSON.stringify({ pid: process.pid, instanceId: this.instanceId, timestamp: Date.now() }),
+      { flag: "wx" }
+    );
+    return true;
+  }
+
+  private readLockData(): { pid: number; instanceId: string } | null {
+    try {
+      if (!fs.existsSync(LOCK_FILE)) {
+        return null;
+      }
+
+      return JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  private removeLockFile(): void {
+    try {
+      if (fs.existsSync(LOCK_FILE)) {
+        fs.unlinkSync(LOCK_FILE);
+      }
+    } catch {
+    }
+  }
+
   public async checkAndCreateLock(): Promise<boolean> {
     // SSE 模式不需要进程锁（多个客户端连接到同一个进程是正常行为）
     if (this.skipLock) {
@@ -77,35 +107,42 @@ export class ProcessManager {
       // 2) 确保锁文件目录存在（避免 ENOENT）
       fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
 
-      // 旧逻辑保持不变：存在则尝试终止旧进程并清理
-      if (fs.existsSync(LOCK_FILE)) {
-        const lockData = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          process.kill(lockData.pid, 0);
-          console.error("发现已存在的MCP-SSH实例，正在终止旧进程...");
-          process.kill(lockData.pid, "SIGTERM");
-
-          const exited = await this.waitForProcessExit(lockData.pid);
-          if (!exited) {
-            console.error("等待旧进程退出超时");
-            return false;
+          this.tryCreateLockFile();
+          console.error("MCP-SSH进程锁创建成功:", LOCK_FILE);
+          return true;
+        } catch (error: any) {
+          if (error?.code !== "EEXIST") {
+            throw error;
           }
-          fs.unlinkSync(LOCK_FILE);
-        } catch {
-          console.error("发现旧的锁文件但进程已不存在，正在清理...");
-          fs.unlinkSync(LOCK_FILE);
+
+          const lockData = this.readLockData();
+          if (!lockData) {
+            this.removeLockFile();
+            continue;
+          }
+
+          try {
+            process.kill(lockData.pid, 0);
+            console.error("发现已存在的MCP-SSH实例，正在终止旧进程...");
+            process.kill(lockData.pid, "SIGTERM");
+
+            const exited = await this.waitForProcessExit(lockData.pid);
+            if (!exited) {
+              console.error("等待旧进程退出超时");
+              return false;
+            }
+            this.removeLockFile();
+          } catch {
+            console.error("发现旧的锁文件但进程已不存在，正在清理...");
+            this.removeLockFile();
+          }
         }
       }
 
-      // 3) 原子创建：防止并发时互相覆盖（wx = 文件存在就失败）
-      fs.writeFileSync(
-        LOCK_FILE,
-        JSON.stringify({ pid: process.pid, instanceId: this.instanceId, timestamp: Date.now() }),
-        { flag: "wx" }
-      );
-
-      console.error("MCP-SSH进程锁创建成功:", LOCK_FILE);
-      return true;
+      console.error("处理锁文件时出错: 重试后仍无法获取锁");
+      return false;
     } catch (error: any) {
       // 如果是并发导致已存在，可以给更友好的提示
       if (error?.code === "EEXIST") {

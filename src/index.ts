@@ -45,6 +45,11 @@ async function startStdioMode() {
     process.exit(exitCode);
   }
 
+  function shutdownOnFatalError(reason: string, error: unknown): void {
+    console.error(reason, error);
+    gracefulShutdown(sshMCP, processManager, 1, '发生致命错误，正在关闭SSH MCP服务...').catch(() => process.exit(1));
+  }
+
   // 初始化进程管理器
   const processManager = new ProcessManager();
   if (!await processManager.checkAndCreateLock()) {
@@ -72,17 +77,21 @@ async function startStdioMode() {
 
   // uncaughtException / unhandledRejection 只记录日志，不杀进程
   process.on('uncaughtException', (err) => {
-    console.error('未捕获的异常（不退出）:', err);
     if (isShuttingDown) {
-      gracefulShutdown(sshMCP, processManager, 1, '关闭过程中发生异常').catch(() => process.exit(1));
+      shutdownOnFatalError('关闭过程中发生未捕获的异常:', err);
+      return;
     }
+
+    shutdownOnFatalError('未捕获的异常，准备退出:', err);
   });
 
   process.on('unhandledRejection', (reason) => {
-    console.error('未处理的Promise拒绝（不退出）:', reason);
     if (isShuttingDown) {
-      gracefulShutdown(sshMCP, processManager, 1, '关闭过程中发生异常').catch(() => process.exit(1));
+      shutdownOnFatalError('关闭过程中发生未处理的Promise拒绝:', reason);
+      return;
     }
+
+    shutdownOnFatalError('未处理的Promise拒绝，准备退出:', reason);
   });
 
   // 监听 stdin 的结束事件

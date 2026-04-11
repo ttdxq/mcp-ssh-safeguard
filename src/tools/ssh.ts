@@ -19,12 +19,21 @@ interface OperationPolicyAssessment {
   };
 }
 
-// ── 共享单例：所有 SshMCP 实例共用同一份服务和状态 ──
+interface BackgroundExecutionState {
+  interval: NodeJS.Timeout;
+  lastCheck: Date;
+}
+
+interface PendingConfirmationEntry {
+  command: string;
+  safetyResult: SafetyCheckResult;
+  expiresAt: number;
+}
+
+// ── 共享单例：仅共享明确需要跨客户端复用的服务 ──
 let _sharedSshService: SSHService | null = null;
 let _sharedSafetyCheckService: SafetyCheckService | null = null;
 let _sharedOutputCacheService: OutputCacheService | null = null;
-let _sharedActiveConnections: Map<string, Date> | null = null;
-let _sharedBackgroundExecutions: Map<string, { interval: NodeJS.Timeout, lastCheck: Date }> | null = null;
 
 function getSharedSshService(): SSHService {
   if (!_sharedSshService) {
@@ -35,7 +44,7 @@ function getSharedSshService(): SSHService {
 
 function getSharedSafetyCheckService(): SafetyCheckService | null {
   if (!_sharedSafetyCheckService) {
-    if (process.env.SAFETY_CHECK_ENABLED !== 'false') {
+    if (process.env.SAFETY_CHECK_ENABLED === 'true') {
       const apiKey = process.env.OPENAI_API_KEY || process.env.ARK_API_KEY;
       const apiBase = process.env.OPENAI_API_BASE || process.env.ARK_API_BASE;
       const model = process.env.OPENAI_MODEL || process.env.ARK_MODEL || 'gpt-3.5-turbo';
@@ -59,36 +68,25 @@ function getSharedOutputCacheService(): OutputCacheService {
   return _sharedOutputCacheService;
 }
 
-function getSharedActiveConnections(): Map<string, Date> {
-  if (!_sharedActiveConnections) {
-    _sharedActiveConnections = new Map();
-  }
-  return _sharedActiveConnections;
-}
-
-function getSharedBackgroundExecutions(): Map<string, { interval: NodeJS.Timeout, lastCheck: Date }> {
-  if (!_sharedBackgroundExecutions) {
-    _sharedBackgroundExecutions = new Map();
-  }
-  return _sharedBackgroundExecutions;
-}
-
 export class SshMCP {
+  private static readonly PENDING_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
+
   private server: McpServer;
   private sshService: SSHService;
   private safetyCheckService: SafetyCheckService | null = null;
   private outputCacheService: OutputCacheService;
   private activeConnections: Map<string, Date>;
-  private backgroundExecutions: Map<string, { interval: NodeJS.Timeout, lastCheck: Date }>;
-  private pendingConfirmations: Map<string, { command: string, safetyResult: SafetyCheckResult }> = new Map();
+  private backgroundExecutions: Map<string, BackgroundExecutionState>;
+  private pendingConfirmations: Map<string, PendingConfirmationEntry> = new Map();
 
   constructor() {
-    // 使用共享单例服务——多个 MCP 客户端（SSE 模式）共享同一份状态
+    // 使用共享单例服务——多个 MCP 客户端（SSE 模式）共享同一份 SSH 后端能力
     this.sshService = getSharedSshService();
     this.safetyCheckService = getSharedSafetyCheckService();
     this.outputCacheService = getSharedOutputCacheService();
-    this.activeConnections = getSharedActiveConnections();
-    this.backgroundExecutions = getSharedBackgroundExecutions();
+    // 这些状态应当按客户端实例隔离，避免 SSE 客户端互相看到彼此的活动和确认态
+    this.activeConnections = new Map();
+    this.backgroundExecutions = new Map();
 
     // 初始化MCP服务器（每个客户端连接独立一个 McpServer 实例）
     this.server = new McpServer({
@@ -104,6 +102,7 @@ export class SshMCP {
    * 连接到指定的传输层（stdio / SSE 等）
    */
   async connectTransport(transport: any): Promise<void> {
+    await this.sshService.waitUntilReady();
     await this.server.connect(transport);
   }
 
@@ -248,6 +247,15 @@ export class SshMCP {
     return `${operationType}:${connectionId}:${command}`;
   }
 
+  private cleanupExpiredPendingConfirmations(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.pendingConfirmations.entries()) {
+      if (entry.expiresAt <= now) {
+        this.pendingConfirmations.delete(key);
+      }
+    }
+  }
+
   private buildPendingConfirmationResponse(operationSummary: string, safetyResult: SafetyCheckResult): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
     if (safetyResult.level === 'moderate') {
       return {
@@ -274,6 +282,8 @@ export class SshMCP {
     operationSummary?: string;
   }): Promise<OperationPolicyAssessment> {
     const { connectionId, command, confirmation, operationType, operationSummary = command } = params;
+    this.cleanupExpiredPendingConfirmations();
+
     const pendingKey = this.createPendingConfirmationKey(connectionId, operationType, command);
     const pending = this.pendingConfirmations.get(pendingKey);
 
@@ -348,7 +358,11 @@ export class SshMCP {
       return { allowed: true };
     }
 
-    this.pendingConfirmations.set(pendingKey, { command, safetyResult });
+    this.pendingConfirmations.set(pendingKey, {
+      command,
+      safetyResult,
+      expiresAt: Date.now() + SshMCP.PENDING_CONFIRMATION_TTL_MS
+    });
     return {
       allowed: false,
       response: this.buildPendingConfirmationResponse(operationSummary, safetyResult)
@@ -1767,9 +1781,6 @@ export class SshMCP {
             };
           }
           
-          // 获取传输信息
-          const transferInfos = transferIds.map(id => this.sshService.getTransferInfo(id)).filter(Boolean) as FileTransferInfo[];
-          
           // 设置批量传输进度监听
           const listeners: (() => void)[] = [];
           
@@ -1805,9 +1816,13 @@ export class SshMCP {
               }, 500);
             });
             
-            // 计算成功和失败的数量
-            const successCount = transferInfos.filter(info => info.status === 'completed').length;
-            const failedCount = transferInfos.filter(info => info.status === 'failed').length;
+            // 重新获取最终传输信息，避免依赖旧引用状态
+            const finalTransferInfos = transferIds
+              .map(id => this.sshService.getTransferInfo(id))
+              .filter(Boolean) as FileTransferInfo[];
+
+            const successCount = finalTransferInfos.filter(info => info.status === 'completed').length;
+            const failedCount = finalTransferInfos.filter(info => info.status === 'failed').length;
             
             return {
               content: [{
@@ -1932,9 +1947,6 @@ export class SshMCP {
             };
           }
           
-          // 获取传输信息
-          const transferInfos = transferIds.map(id => this.sshService.getTransferInfo(id)).filter(Boolean) as FileTransferInfo[];
-          
           // 设置批量传输进度监听
           const listeners: (() => void)[] = [];
           
@@ -1970,9 +1982,13 @@ export class SshMCP {
               }, 500);
             });
             
-            // 计算成功和失败的数量
-            const successCount = transferInfos.filter(info => info.status === 'completed').length;
-            const failedCount = transferInfos.filter(info => info.status === 'failed').length;
+            // 重新获取最终传输信息，避免依赖旧引用状态
+            const finalTransferInfos = transferIds
+              .map(id => this.sshService.getTransferInfo(id))
+              .filter(Boolean) as FileTransferInfo[];
+
+            const successCount = finalTransferInfos.filter(info => info.status === 'completed').length;
+            const failedCount = finalTransferInfos.filter(info => info.status === 'failed').length;
             
             return {
               content: [{
@@ -2721,26 +2737,6 @@ export class SshMCP {
       // 停止所有后台任务
       for (const id of this.backgroundExecutions.keys()) {
         this.stopBackgroundExecution(id);
-      }
-      
-      // 关闭所有隧道
-      const tunnels = this.sshService.getTunnels();
-      for (const tunnel of tunnels) {
-        await this.sshService.closeTunnel(tunnel.id!);
-      }
-
-      // 关闭所有终端会话
-      const sessions = this.sshService.getAllTerminalSessions();
-      for (const session of sessions) {
-        await this.sshService.closeTerminalSession(session.id);
-      }
-      
-      // 断开所有连接
-      const connections = await this.sshService.getAllConnections();
-      for (const connection of connections) {
-        if (connection.status === ConnectionStatus.CONNECTED) {
-          await this.sshService.disconnect(connection.id);
-        }
       }
       
       // 关闭SSH服务
