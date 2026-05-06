@@ -23,13 +23,17 @@ import * as http from 'http';
 import { SshMCP } from './tools/ssh.js';
 import { config } from 'dotenv';
 import { ReliableSSEServerTransport, type ReliableSseLogEvent } from './reliable-sse-server-transport.js';
+import { loadConfig } from './services/runtime-config.js';
 
 config();
 
-const PORT = parseInt(process.env.MCP_SSE_PORT || '3001', 10);
-const HOST = process.env.MCP_SSE_HOST || '127.0.0.1';
-const SSE_HEARTBEAT_INTERVAL_MS = parseInt(process.env.MCP_SSE_HEARTBEAT_INTERVAL || '15000', 10);
-const SSE_WRITE_TIMEOUT_MS = parseInt(process.env.MCP_SSE_WRITE_TIMEOUT || '5000', 10);
+const cfg = loadConfig();
+
+const PORT = cfg.MCP_SSE_PORT ?? 3001;
+const HOST = cfg.MCP_SSE_HOST;
+const SSE_HEARTBEAT_INTERVAL_MS = cfg.MCP_SSE_HEARTBEAT_INTERVAL;
+const SSE_WRITE_TIMEOUT_MS = cfg.MCP_SSE_WRITE_TIMEOUT;
+const SSE_AUTH_TOKEN = cfg.MCP_SSE_AUTH_TOKEN;
 
 type SseLogLanguage = 'zh' | 'en';
 type SseLogLanguageMode = SseLogLanguage | 'auto';
@@ -40,7 +44,7 @@ type SseLogEvent =
   | 'http-message-post'
   | ReliableSseLogEvent;
 
-const SSE_LOG_LANGUAGE_MODE = normalizeSseLogLanguageMode(process.env.MCP_SSE_LOG_LANGUAGE);
+const SSE_LOG_LANGUAGE_MODE = normalizeSseLogLanguageMode(cfg.MCP_SSE_LOG_LANGUAGE);
 
 const SSE_LOG_EVENT_LABELS: Record<SseLogEvent, Record<SseLogLanguage, string>> = {
   'session-open': { zh: '会话已建立', en: 'session-open' },
@@ -131,12 +135,28 @@ function extractSessionId(url: string | undefined): string | null {
 }
 
 const server = http.createServer(async (req, res) => {
+  // ── Bearer token auth ──
+  if (SSE_AUTH_TOKEN) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const queryToken = req.url ? new URL(req.url, `http://${HOST}:${PORT}`).searchParams.get('token') : null;
+
+    if (token !== SSE_AUTH_TOKEN && queryToken !== SSE_AUTH_TOKEN) {
+      res.writeHead(401, {
+        'Content-Type': 'text/plain',
+        'WWW-Authenticate': 'Bearer realm="mcp-ssh-safeguard"',
+      });
+      res.end('Unauthorized');
+      return;
+    }
+  }
+
   // ── CORS 预检（方便调试） ──
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     });
     res.end();
     return;
