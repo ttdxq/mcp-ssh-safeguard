@@ -22,6 +22,9 @@ In simple terms, it enables AI assistants to perform various SSH operations, suc
 - **File Operations**: Upload, download, and view file contents
 - **Process Management**: Detect blocking processes, smart waiting, and timeout handling
 - **Security Control**: Password/key authentication, timeout control, and error handling
+- **SSH Config Import**: Import existing server connections from `~/.ssh/config` with one command
+- **Configurable Safety Rules**: User-defined allowlist/denylist to override default safety check policies
+- **SSE Access Control**: Protect SSE endpoints with Bearer Token to prevent unauthorized access
 </details>
 
 <details>
@@ -355,6 +358,18 @@ Replace the original `command` + `args` configuration with `url`:
 }
 ```
 
+If the SSE server has authentication enabled (`MCP_SSE_AUTH_TOKEN` is set), include the token in the client configuration:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-safeguard": {
+      "url": "http://127.0.0.1:3001/sse?token=your-secret-token"
+    }
+  }
+}
+```
+
 If you need to configure environment variables (API keys, etc.), set them before starting the SSE server:
 
 ```bash
@@ -368,6 +383,7 @@ MCP_SSE_PORT=3001
 MCP_SSE_HEARTBEAT_INTERVAL=15000
 MCP_SSE_WRITE_TIMEOUT=5000
 MCP_SSE_LOG_LANGUAGE=auto
+MCP_SSE_AUTH_TOKEN=your-secret-token
 OPENAI_API_KEY=your-key
 OPENAI_API_BASE=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1-mini
@@ -379,6 +395,7 @@ SAFETY_CHECK_ENABLED=true
 - `MCP_SSE_HEARTBEAT_INTERVAL`: SSE heartbeat interval in milliseconds. Default: `15000`
 - `MCP_SSE_WRITE_TIMEOUT`: timeout for waiting on `drain` during SSE writes, in milliseconds. Default: `5000`
 - `MCP_SSE_LOG_LANGUAGE`: SSE log language. Supported values: `zh`, `en`, `auto`. Default: `auto`
+- `MCP_SSE_AUTH_TOKEN`: SSE access token. When set, all requests must include `Authorization: Bearer <token>` header or `?token=<token>` query parameter. Authentication is disabled when unset
 - The SSE server now sends heartbeat comments for idle connections to reduce silent disconnects during long-blocking command execution
 - SSE writes now handle Node.js backpressure; if the client is too slow or the connection is unhealthy, the failure is recorded in logs
 - When `MCP_SSE_LOG_LANGUAGE=zh` or `en`, SSE log event names are forced to that language
@@ -480,6 +497,32 @@ Complete tmux session management support:
 - Support for sending keystrokes
 - Real-time session output capture
 - Intelligent session state handling
+
+### SSH Config Import
+
+Import existing SSH connections from your local `~/.ssh/config` file:
+
+- Auto-detects platform-default config paths (Windows/macOS/Linux)
+- Skips wildcard Host patterns (`*`, `?`)
+- Use the `importSSHConfig` tool to import in one step
+- Use the `getSSHConfigPaths` tool to see available config file paths on the current platform
+
+### Configurable Safety Rules
+
+Beyond AI safety checks and built-in local rules, you can define custom safety rules:
+
+- **allowlist**: Matching commands are processed at the specified level, overriding local rules
+- **denylist**: Matching commands are always blocked or flagged with the highest priority
+- Each rule has a `pattern` (regex), `level` (safe/moderate/dangerous), and `reason` (description)
+- Rules persist to `DATA_PATH/safety-rules.json` and reload automatically on restart
+- Use `listSafetyRules` to view current rules and `updateSafetyRules` to replace them entirely
+
+Usage examples:
+
+```
+Add "kubectl rollout restart" to the safety rule allowlist
+Add "docker system prune" to the safety rule denylist
+```
 
 ## Enhanced Prompt Settings
 

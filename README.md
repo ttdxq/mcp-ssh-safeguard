@@ -22,6 +22,9 @@
 - **文件操作**：上传、下载、查看文件内容
 - **进程管理**：检测阻塞进程、智能等待、超时处理
 - **安全控制**：密码/密钥认证、超时控制、错误处理
+- **SSH 配置导入**：从 `~/.ssh/config` 一键导入已有服务器连接
+- **可配置安全规则**：用户自定义 allowlist/denylist 覆盖默认安全检查策略
+- **SSE 访问控制**：通过 Bearer Token 保护 SSE 端点，防止未授权访问
 </details>
 
 <details>
@@ -355,6 +358,18 @@ MCP_SSE_LOG_LANGUAGE=zh npm run mcp:sse
 }
 ```
 
+如果 SSE 服务器启用了认证（设置了 `MCP_SSE_AUTH_TOKEN`），客户端配置需要附带 token：
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-safeguard": {
+      "url": "http://127.0.0.1:3001/sse?token=your-secret-token"
+    }
+  }
+}
+```
+
 如果需要配置环境变量（API Key 等），在启动 SSE 服务器之前设置：
 
 ```bash
@@ -368,6 +383,7 @@ MCP_SSE_PORT=3001
 MCP_SSE_HEARTBEAT_INTERVAL=15000
 MCP_SSE_WRITE_TIMEOUT=5000
 MCP_SSE_LOG_LANGUAGE=auto
+MCP_SSE_AUTH_TOKEN=your-secret-token
 OPENAI_API_KEY=your-key
 OPENAI_API_BASE=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1-mini
@@ -379,6 +395,7 @@ SAFETY_CHECK_ENABLED=true
 - `MCP_SSE_HEARTBEAT_INTERVAL`：SSE 心跳间隔，单位毫秒，默认 `15000`
 - `MCP_SSE_WRITE_TIMEOUT`：SSE 写回等待 `drain` 的超时，单位毫秒，默认 `5000`
 - `MCP_SSE_LOG_LANGUAGE`：SSE 日志语言，支持 `zh`、`en`、`auto`，默认 `auto`
+- `MCP_SSE_AUTH_TOKEN`：SSE 访问令牌，设置后所有请求需携带 `Authorization: Bearer <token>` 或 URL 参数 `?token=<token>`；不设置则不启用认证
 - SSE 服务器会为长时间空闲的连接持续发送心跳，降低长阻塞命令结果回传时因链路静默而断开的概率
 - SSE 写回现在会处理 Node.js 的 backpressure；如果客户端过慢或连接异常，会在日志中记录发送失败
 - 当 `MCP_SSE_LOG_LANGUAGE=zh` 或 `en` 时，SSE 日志事件名会强制使用对应语言
@@ -480,6 +497,32 @@ SSH MCP 工具内置了智能的阻塞检测机制：
 - 支持发送按键序列
 - 实时捕获会话输出
 - 智能处理会话状态
+
+### SSH 配置导入
+
+支持从本地 `~/.ssh/config` 文件导入已有的 SSH 连接配置：
+
+- 自动检测平台默认配置路径（Windows/macOS/Linux）
+- 跳过通配符 Host 模式（`*`、`?`）
+- 通过 `importSSHConfig` 工具一键导入
+- 通过 `getSSHConfigPaths` 查看当前平台可用的配置文件路径
+
+### 可配置安全规则
+
+在 AI 安全检查和本地规则之外，支持用户自定义安全规则：
+
+- **allowlist**：匹配的命令直接按指定级别处理，覆盖本地规则
+- **denylist**：匹配的命令始终拦截或标记，优先级最高
+- 每条规则包含 `pattern`（正则表达式）、`level`（safe/moderate/dangerous）、`reason`（说明）
+- 规则持久化到 `DATA_PATH/safety-rules.json`，重启后自动加载
+- 通过 `listSafetyRules` 查看当前规则，`updateSafetyRules` 全量更新
+
+使用示例：
+
+```
+请将 "kubectl rollout restart" 加入安全规则白名单
+请将 "docker system prune" 加入安全规则黑名单
+```
 
 ## 增强提示设置
 
