@@ -385,6 +385,50 @@ export class SshMCP {
         };
       }
     );
+
+    this.server.tool(
+      'addSafetyRule',
+      'Add a single rule to the allowlist or denylist without replacing existing rules.',
+      {
+        list: z.enum(['allowlist', 'denylist']).describe('Which list to add the rule to. Use denylist to always block/flag matching commands (highest priority). Use allowlist to override local rules for matching commands.'),
+        pattern: z.string().describe('Regex pattern to match against commands (case-insensitive)'),
+        level: z.enum(['safe', 'moderate', 'dangerous']),
+        reason: z.string().describe('Explanation for this rule'),
+      },
+      async ({ list, pattern, level, reason }) => {
+        if (!this.safetyCheckService) {
+          return {
+            content: [{ type: 'text', text: 'Safety check service is not enabled. Set SAFETY_CHECK_ENABLED=true to enable.' }],
+            isError: true,
+          };
+        }
+
+        try {
+          new RegExp(pattern);
+        } catch {
+          return {
+            content: [{ type: 'text', text: `Invalid regex pattern: "${pattern}"` }],
+            isError: true,
+          };
+        }
+
+        const current = this.safetyCheckService.getUserRules();
+        const newRule = { pattern, level, reason };
+        const updated = {
+          allowlist: list === 'allowlist' ? [...current.allowlist, newRule] : current.allowlist,
+          denylist: list === 'denylist' ? [...current.denylist, newRule] : current.denylist,
+        };
+        this.safetyCheckService.updateUserRules(updated);
+
+        const listLabel = list === 'denylist' ? 'denylist (highest priority)' : 'allowlist (overrides local rules)';
+        return {
+          content: [{
+            type: 'text',
+            text: `Rule added to ${listLabel}: [${level}] /${pattern}/ -> ${reason}`,
+          }],
+        };
+      }
+    );
   }
 
   public async close(): Promise<void> {
