@@ -1,17 +1,17 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { loadConfig } from "./services/runtime-config.js";
 
-// 1) 优先读环境变量，其次用 LocalAppData（Windows）/ tmp（跨平台兜底）
 function getLockFilePath() {
+  const cfg = loadConfig();
   const fromEnv =
-    process.env.LOCK_FILE_PATH ||
-    process.env.MCP_SSH_LOCK_PATH ||
-    process.env.MCP_LOCK_FILE;
+    cfg.LOCK_FILE_PATH ||
+    cfg.MCP_SSH_LOCK_PATH ||
+    cfg.MCP_LOCK_FILE;
 
   if (fromEnv && fromEnv.trim()) return fromEnv;
 
-  // Windows: C:\Users\<u>\AppData\Local\mcp-ssh-safeguard\.mcp-ssh.lock
   const base =
     process.env.LOCALAPPDATA
       ? path.join(process.env.LOCALAPPDATA, "mcp-ssh-safeguard")
@@ -28,7 +28,7 @@ export class ProcessManager {
 
   constructor(skipLock: boolean = false) {
     this.instanceId = Date.now().toString();
-    this.skipLock = skipLock || !!process.env.MCP_SSE_PORT;
+    this.skipLock = skipLock || loadConfig().MCP_SSE_PORT !== undefined;
     if (!this.skipLock) {
       this.registerCleanup();
     }

@@ -4,13 +4,11 @@ import { SshMCP } from './tools/ssh.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { config } from 'dotenv';
 import { ProcessManager } from './process-manager.js';
+import { loadConfig } from './services/runtime-config.js';
 
-// 加载环境变量
 config();
 
-// 如果设置了 MCP_SSE_PORT，则走 SSE 模式（由 sse-server.ts 处理）
-// 否则走 stdio 模式（当前文件的默认行为）
-const SSE_MODE = !!process.env.MCP_SSE_PORT;
+const SSE_MODE = loadConfig().MCP_SSE_PORT !== undefined;
 
 if (SSE_MODE) {
   // SSE 模式：动态导入 sse-server.ts，由其自行启动 HTTP 服务器
