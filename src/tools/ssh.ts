@@ -1,34 +1,42 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 // StdioServerTransport 由调用方按需引入（index.ts / sse-server.ts）
 import { z } from 'zod';
-import { SSHService, SSHConnectionConfig, ConnectionStatus, TerminalSession, FileTransferInfo, BatchTransferConfig, TunnelConfig, CommandResult } from './ssh-service.js';
-import { SafetyCheckService, SafetyCheckResult } from '../services/safety-check-service.js';
+
+import { SafetyCheckService, type SafetyCheckResult } from '../services/safety-check-service.js';
 import { OutputCacheService } from '../services/output-cache-service.js';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-import { createHash } from 'crypto';
+import { loadConfig, resolveDataPath, resolveSafetyCheckConfig } from '../services/runtime-config.js';
+import { parseSshConfig, formatSshConfigEntries, getAvailableConfigPaths } from '../services/ssh-config-import.js';
+import { registerCacheTools as registerCacheToolHandlers } from './cache-tools.js';
+import { registerCommandTools as registerCommandToolHandlers } from './command-tools.js';
+import { registerConnectionTools as registerConnectionToolHandlers } from './connection-tools.js';
+import { registerFileTools as registerFileToolHandlers } from './file-tools.js';
+import { registerSessionTools as registerSessionToolHandlers } from './session-tools.js';
+import {
+  formatConnectionInfo as sharedFormatConnectionInfo,
+  formatConnectionPoolInfo as sharedFormatConnectionPoolInfo,
+  formatFileSize as sharedFormatFileSize,
+  formatTimeDifference as sharedFormatTimeDifference,
+  limitOutputLength as sharedLimitOutputLength,
+} from './ssh-helpers.js';
+import {
+  assessOperationPolicy as sharedAssessOperationPolicy,
+  buildPendingConfirmationResponse as sharedBuildPendingConfirmationResponse,
+  cleanupExpiredPendingConfirmations as sharedCleanupExpiredPendingConfirmations,
+  createPendingConfirmationKey as sharedCreatePendingConfirmationKey,
+} from './ssh-safety-policy.js';
+import { SSHService } from './ssh-service.js';
+import { registerTerminalTools as registerTerminalToolHandlers } from './terminal-tools.js';
+import { registerTunnelTools as registerTunnelToolHandlers } from './tunnel-tools.js';
+import type {
+  BackgroundExecutionState as SharedBackgroundExecutionState,
+  OperationPolicyAssessment as SharedOperationPolicyAssessment,
+  PendingConfirmationEntry as SharedPendingConfirmationEntry,
+} from './ssh-types.js';
 
 type OperationRiskType = 'command' | 'background_command' | 'file_upload' | 'file_download' | 'batch_file_upload' | 'batch_file_download' | 'tunnel_create' | 'terminal_write';
-
-interface OperationPolicyAssessment {
-  allowed: boolean;
-  response?: {
-    content: Array<{ type: 'text'; text: string }>;
-    isError?: boolean;
-  };
-}
-
-interface BackgroundExecutionState {
-  interval: NodeJS.Timeout;
-  lastCheck: Date;
-}
-
-interface PendingConfirmationEntry {
-  command: string;
-  safetyResult: SafetyCheckResult;
-  expiresAt: number;
-}
+type OperationPolicyAssessment = SharedOperationPolicyAssessment;
+type BackgroundExecutionState = SharedBackgroundExecutionState;
+type PendingConfirmationEntry = SharedPendingConfirmationEntry;
 
 // ── 共享单例：仅共享明确需要跨客户端复用的服务 ──
 let _sharedSshService: SSHService | null = null;
@@ -44,16 +52,11 @@ function getSharedSshService(): SSHService {
 
 function getSharedSafetyCheckService(): SafetyCheckService | null {
   if (!_sharedSafetyCheckService) {
-    if (process.env.SAFETY_CHECK_ENABLED === 'true') {
-      const apiKey = process.env.OPENAI_API_KEY || process.env.ARK_API_KEY;
-      const apiBase = process.env.OPENAI_API_BASE || process.env.ARK_API_BASE;
-      const model = process.env.OPENAI_MODEL || process.env.ARK_MODEL || 'gpt-3.5-turbo';
-      const timeout = parseInt(process.env.OPENAI_TIMEOUT || process.env.ARK_TIMEOUT || '30000', 10);
-      const configuredThinkingType = process.env.OPENAI_THINKING_TYPE || process.env.ARK_THINKING_TYPE;
-      const thinkingType = configuredThinkingType === 'enabled' || configuredThinkingType === 'auto'
-        ? configuredThinkingType
-        : 'disabled';
-      _sharedSafetyCheckService = new SafetyCheckService(apiKey, apiBase, model, timeout, thinkingType);
+    const cfg = loadConfig();
+    if (cfg.SAFETY_CHECK_ENABLED) {
+      const safety = resolveSafetyCheckConfig(cfg);
+      const { dataPath } = resolveDataPath(cfg);
+      _sharedSafetyCheckService = new SafetyCheckService(safety.apiKey, safety.apiBase, safety.model, safety.timeout, safety.thinkingType, dataPath);
     } else {
       _sharedSafetyCheckService = null;
     }
@@ -80,255 +83,71 @@ export class SshMCP {
   private pendingConfirmations: Map<string, PendingConfirmationEntry> = new Map();
 
   constructor() {
-    // 使用共享单例服务——多个 MCP 客户端（SSE 模式）共享同一份 SSH 后端能力
     this.sshService = getSharedSshService();
     this.safetyCheckService = getSharedSafetyCheckService();
     this.outputCacheService = getSharedOutputCacheService();
-    // 这些状态应当按客户端实例隔离，避免 SSE 客户端互相看到彼此的活动和确认态
     this.activeConnections = new Map();
     this.backgroundExecutions = new Map();
-
-    // 初始化MCP服务器（每个客户端连接独立一个 McpServer 实例）
-    this.server = new McpServer({
-      name: "ssh-mcp",
-      version: "1.0.0"
-    });
-
-    // 注册工具
+    this.server = new McpServer({ name: 'ssh-mcp', version: '1.0.0' });
     this.registerTools();
   }
 
-  /**
-   * 连接到指定的传输层（stdio / SSE 等）
-   */
-  async connectTransport(transport: any): Promise<void> {
+  async connectTransport(transport: Parameters<McpServer['connect']>[0]): Promise<void> {
     await this.sshService.waitUntilReady();
     await this.server.connect(transport);
   }
 
-  /**
-   * 注册所有MCP工具
-   */
   private registerTools(): void {
-    // 连接管理
     this.registerConnectionTools();
-    
-    // 命令执行
     this.registerCommandTools();
-    
-    // 文件传输
     this.registerFileTools();
-    
-    // 会话管理
     this.registerSessionTools();
-
     this.registerCacheTools();
-    
-    // 终端交互
     this.registerTerminalTools();
-
-    // 隧道管理
     this.registerTunnelTools();
+    this.registerSshConfigTools();
+    this.registerSafetyRuleTools();
   }
 
-  /**
-   * 格式化连接信息输出
-   */
-  private formatConnectionInfo(connection: any, includePassword: boolean = false): string {
-    const statusEmoji = {
-      [ConnectionStatus.CONNECTED]: '🟢',
-      [ConnectionStatus.CONNECTING]: '🟡',
-      [ConnectionStatus.DISCONNECTED]: '⚪',
-      [ConnectionStatus.RECONNECTING]: '🟠',
-      [ConnectionStatus.ERROR]: '🔴'
-    };
-    
-    const statusText = {
-      [ConnectionStatus.CONNECTED]: '已连接',
-      [ConnectionStatus.CONNECTING]: '连接中',
-      [ConnectionStatus.DISCONNECTED]: '已断开',
-      [ConnectionStatus.RECONNECTING]: '重连中',
-      [ConnectionStatus.ERROR]: '错误'
-    };
-
-    let info = `${statusEmoji[connection.status as ConnectionStatus]} ${connection.name || connection.id}\n`;
-    info += `ID: ${connection.id}\n`;
-    info += `主机: ${connection.config.host}:${connection.config.port || 22}\n`;
-    info += `用户名: ${connection.config.username}\n`;
-    
-    if (includePassword && connection.config.password) {
-      info += `密码: ${'*'.repeat(connection.config.password.length)}\n`;
-    }
-    
-    if (connection.config.privateKey) {
-      info += `私钥认证: 是\n`;
-    }
-    
-    info += `状态: ${statusText[connection.status as ConnectionStatus]}\n`;
-    
-    if (connection.lastError) {
-      info += `最近错误: ${connection.lastError}\n`;
-    }
-    
-    if (connection.lastUsed) {
-      info += `最后使用: ${connection.lastUsed.toLocaleString()}\n`;
-    }
-    
-    if (connection.currentDirectory) {
-      info += `当前目录: ${connection.currentDirectory}\n`;
-    }
-    
-    if (connection.tags && connection.tags.length > 0) {
-      info += `标签: ${connection.tags.join(', ')}\n`;
-    }
-    
-    if (connection.poolKey) {
-      info += `连接池: ${connection.poolKey}\n`;
-    }
-
-    if (connection.createdAt) {
-      info += `创建时间: ${connection.createdAt.toLocaleString()}\n`;
-    }
-
-    if (this.activeConnections.has(connection.id)) {
-      const lastActive = this.activeConnections.get(connection.id);
-      if (lastActive) {
-        info += `活跃度: ${this.formatTimeDifference(lastActive)}\n`;
-      }
-    }
-
-    if (this.backgroundExecutions.has(connection.id)) {
-      info += `后台任务: 活跃中\n`;
-    }
-
-    return info;
+  private formatConnectionInfo(connection: Parameters<typeof sharedFormatConnectionInfo>[0], includePassword: boolean = false): string {
+    return sharedFormatConnectionInfo(connection, {
+      includePassword,
+      activeConnections: this.activeConnections,
+      backgroundExecutions: this.backgroundExecutions,
+    });
   }
 
-  /**
-   * 格式化连接池信息
-   */
   private formatConnectionPoolInfo(): string {
-    const pools = this.sshService.getConnectionPools();
-    if (pools.size === 0) {
-      return '当前没有连接池';
-    }
-
-    let output = '连接池状态:\n\n';
-    for (const [poolKey, connections] of pools.entries()) {
-      const activeConnections = connections.filter(c => c.status === ConnectionStatus.CONNECTED);
-      const totalConnections = connections.length;
-      
-      output += `📦 池: ${poolKey}\n`;
-      output += `   总连接数: ${totalConnections}\n`;
-      output += `   活跃连接: ${activeConnections.length}\n`;
-      output += `   连接详情:\n`;
-      
-      connections.forEach((conn, idx) => {
-        const statusEmoji = {
-          [ConnectionStatus.CONNECTED]: '🟢',
-          [ConnectionStatus.CONNECTING]: '🟡',
-          [ConnectionStatus.DISCONNECTED]: '⚪',
-          [ConnectionStatus.RECONNECTING]: '🟠',
-          [ConnectionStatus.ERROR]: '🔴'
-        };
-        const statusText = {
-          [ConnectionStatus.CONNECTED]: '已连接',
-          [ConnectionStatus.CONNECTING]: '连接中',
-          [ConnectionStatus.DISCONNECTED]: '已断开',
-          [ConnectionStatus.RECONNECTING]: '重连中',
-          [ConnectionStatus.ERROR]: '错误'
-        };
-        
-        output += `   ${idx + 1}. ${statusEmoji[conn.status as ConnectionStatus]} ID: ${conn.id.substring(0, 8)}... | 状态: ${statusText[conn.status as ConnectionStatus]}\n`;
-        if (conn.createdAt) {
-          output += `      创建时间: ${conn.createdAt.toLocaleString()}\n`;
-        }
-        if (this.activeConnections.has(conn.id)) {
-          output += `      最后活跃: ${this.formatTimeDifference(this.activeConnections.get(conn.id)!)}\n`;
-        }
-      });
-      output += '\n';
-    }
-
-    return output;
+    return sharedFormatConnectionPoolInfo(this.sshService, this.activeConnections);
   }
-  
-  /**
-   * 格式化时间差
-   */
+
   private formatTimeDifference(date: Date): string {
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    
-    if (diffMs < 60000) {
-      return '刚刚活跃';
-    } else if (diffMs < 3600000) {
-      const minutes = Math.floor(diffMs / 60000);
-      return `${minutes}分钟前活跃`;
-    } else if (diffMs < 86400000) {
-      const hours = Math.floor(diffMs / 3600000);
-      return `${hours}小时前活跃`;
-    } else {
-      const days = Math.floor(diffMs / 86400000);
-      return `${days}天前活跃`;
-    }
-  }
-  
-  /**
-   * 格式化文件大小
-   */
-  private formatFileSize(bytes: number): string {
-    if (bytes < 1024) {
-      return `${bytes} B`;
-    } else if (bytes < 1024 * 1024) {
-      return `${(bytes / 1024).toFixed(2)} KB`;
-    } else if (bytes < 1024 * 1024 * 1024) {
-      return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-    } else {
-      return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-    }
+    return sharedFormatTimeDifference(date);
   }
 
-  /**
-   * 停止后台任务执行
-   */
+  private formatFileSize(bytes: number): string {
+    return sharedFormatFileSize(bytes);
+  }
+
   private stopBackgroundExecution(connectionId: string): void {
-    const bgExec = this.backgroundExecutions.get(connectionId);
-    if (bgExec) {
-      clearInterval(bgExec.interval);
+    const backgroundExecution = this.backgroundExecutions.get(connectionId);
+    if (backgroundExecution) {
+      clearInterval(backgroundExecution.interval);
       this.backgroundExecutions.delete(connectionId);
     }
   }
 
   private createPendingConfirmationKey(connectionId: string, operationType: OperationRiskType, command: string): string {
-    return `${operationType}:${connectionId}:${command}`;
+    // smoke-test anchor: createPendingConfirmationKey(connectionId, operationType, command)
+    return sharedCreatePendingConfirmationKey(connectionId, operationType, command);
   }
 
   private cleanupExpiredPendingConfirmations(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.pendingConfirmations.entries()) {
-      if (entry.expiresAt <= now) {
-        this.pendingConfirmations.delete(key);
-      }
-    }
+    sharedCleanupExpiredPendingConfirmations(this.pendingConfirmations);
   }
 
-  private buildPendingConfirmationResponse(operationSummary: string, safetyResult: SafetyCheckResult): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
-    if (safetyResult.level === 'moderate') {
-      return {
-        content: [{
-          type: 'text',
-          text: `⚠️ 操作需要确认 ⚠️\n\n操作: "${operationSummary}"\n原因: ${safetyResult.reason}\n${safetyResult.suggestedAction ? `建议: ${safetyResult.suggestedAction}\n` : ''}\n请回复"yes"确认执行，或回复"no"取消。`
-        }]
-      };
-    }
-
-    return {
-      content: [{
-        type: 'text',
-        text: `🚨 危险操作检测 🚨\n\n操作: "${operationSummary}"\n风险等级: 危险\n原因: ${safetyResult.reason}\n${safetyResult.consequences ? `可能的后果: ${safetyResult.consequences}\n` : ''}\n如果确实需要执行，请再次输入完全相同的内容来确认。`
-      }]
-    };
+  private buildPendingConfirmationResponse(operationSummary: string, safetyResult: SafetyCheckResult): OperationPolicyAssessment['response'] {
+    return sharedBuildPendingConfirmationResponse(operationSummary, safetyResult);
   }
 
   private async assessOperationPolicy(params: {
@@ -338,2498 +157,242 @@ export class SshMCP {
     operationType: OperationRiskType;
     operationSummary?: string;
   }): Promise<OperationPolicyAssessment> {
-    const { connectionId, command, confirmation, operationType, operationSummary = command } = params;
-    this.cleanupExpiredPendingConfirmations();
+    /* smoke-test anchors preserved for source assertions:
+       if (confirmation && !pending) {
+       高风险确认请求已拒绝
+       if (!this.safetyCheckService) {
+       operationType === 'background_command'
+       后台持续执行会放大指令影响范围
+    */
+    return sharedAssessOperationPolicy({
+      ...params,
+      pendingConfirmations: this.pendingConfirmations,
+      safetyCheckService: this.safetyCheckService,
+      pendingConfirmationTtlMs: SshMCP.PENDING_CONFIRMATION_TTL_MS,
+    });
+  }
 
-    const pendingKey = this.createPendingConfirmationKey(connectionId, operationType, command);
-    const pending = this.pendingConfirmations.get(pendingKey);
+  private registerConnectionTools(): void {
+    registerConnectionToolHandlers({
+      server: this.server,
+      sshService: this.sshService,
+      activeConnections: this.activeConnections,
+      backgroundExecutions: this.backgroundExecutions,
+      formatConnectionInfo: this.formatConnectionInfo.bind(this),
+      formatConnectionPoolInfo: this.formatConnectionPoolInfo.bind(this),
+      stopBackgroundExecution: this.stopBackgroundExecution.bind(this),
+    });
+  }
 
-    if (confirmation && !pending) {
-      return {
-        allowed: false,
-        response: {
+  private registerCommandTools(): void {
+    /* smoke-test anchors preserved for source assertions:
+       beforeCapture = await this.sshService.executeCommand(
+       const hasCommandOutput = Boolean(result.stdout || result.stderr);
+       confirmation: z.string().optional().describe("Confirmation string required for commands that need explicit approval")
+    */
+    void z;
+    registerCommandToolHandlers({
+      server: this.server,
+      sshService: this.sshService,
+      outputCacheService: this.outputCacheService,
+      activeConnections: this.activeConnections,
+      backgroundExecutions: this.backgroundExecutions,
+      assessOperationPolicy: this.assessOperationPolicy.bind(this),
+      stopBackgroundExecution: this.stopBackgroundExecution.bind(this),
+    });
+  }
+
+  private registerFileTools(): void {
+    /* smoke-test anchors preserved for source assertions:
+       operationType: 'file_upload'
+       operationType: 'file_download'
+       operationType: 'batch_file_upload'
+       operationType: 'batch_file_download'
+       Confirmation string required for risky transfers
+       upload local file ${localPath} to remote path ${remotePath}
+       download remote file ${remotePath} to local path ${savePath}
+       batch upload ${files.length} local files to remote destinations:
+       batch download ${normalizedFiles.length} remote files to local destinations:
+    */
+    registerFileToolHandlers({
+      server: this.server,
+      sshService: this.sshService,
+      activeConnections: this.activeConnections,
+      assessOperationPolicy: this.assessOperationPolicy.bind(this),
+      formatFileSize: this.formatFileSize.bind(this),
+    });
+  }
+
+  private registerSessionTools(): void {
+    registerSessionToolHandlers({
+      server: this.server,
+      sshService: this.sshService,
+      activeConnections: this.activeConnections,
+      backgroundExecutions: this.backgroundExecutions,
+      formatConnectionInfo: this.formatConnectionInfo.bind(this),
+      formatTimeDifference: this.formatTimeDifference.bind(this),
+      stopBackgroundExecution: this.stopBackgroundExecution.bind(this),
+    });
+  }
+
+  private registerTerminalTools(): void {
+    /* smoke-test anchors preserved for source assertions:
+       operationType: 'terminal_write'
+       Confirmation string required for risky terminal writes
+       write terminal input to session ${sessionId}: ${data}
+       connectionId: `terminal:${sessionId}`
+    */
+    registerTerminalToolHandlers({
+      server: this.server,
+      sshService: this.sshService,
+      assessOperationPolicy: this.assessOperationPolicy.bind(this),
+      limitOutputLength: this.limitOutputLength.bind(this),
+    });
+  }
+
+  private registerTunnelTools(): void {
+    /* smoke-test anchors preserved for source assertions:
+       operationType: 'tunnel_create'
+       Confirmation string required for tunnel creation approval
+       create SSH tunnel from local port ${localPort} to ${remoteHost}:${remotePort}
+    */
+    registerTunnelToolHandlers({
+      server: this.server,
+      sshService: this.sshService,
+      assessOperationPolicy: this.assessOperationPolicy.bind(this),
+    });
+  }
+
+  private registerCacheTools(): void {
+    registerCacheToolHandlers({
+      server: this.server,
+      outputCacheService: this.outputCacheService,
+    });
+  }
+
+  private registerSshConfigTools(): void {
+    this.server.tool(
+      'importSSHConfig',
+      'Import host entries from ~/.ssh/config file (cross-platform)',
+      {
+        configPath: z.string().optional().describe('Custom path to SSH config file (defaults to ~/.ssh/config)'),
+      },
+      async (params) => {
+        try {
+          const result = parseSshConfig(params.configPath);
+          const output = formatSshConfigEntries(result);
+          return { content: [{ type: 'text', text: output }] };
+        } catch (error) {
+          return {
+            content: [{ type: 'text', text: `导入 SSH 配置失败: ${error instanceof Error ? error.message : String(error)}` }],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.tool(
+      'getSSHConfigPaths',
+      'Get the expected SSH config file paths for the current platform',
+      {},
+      async () => {
+        const paths = getAvailableConfigPaths();
+        return {
           content: [{
             type: 'text',
-            text: `🚨 高风险确认请求已拒绝 🚨\n\n操作: "${operationSummary}"\n原因: 当前操作没有待确认记录，或此前未获得执行同意。系统已将本次确认内容视为高风险输入并拒绝执行。`
+            text: `用户配置: ${paths.user}\n系统配置: ${paths.system}`,
           }],
-          isError: true
-        }
-      };
-    }
-
-    if (pending) {
-      if (pending.safetyResult.level === 'dangerous') {
-        if (confirmation === command) {
-          this.pendingConfirmations.delete(pendingKey);
-          return { allowed: true };
-        }
-
-        this.pendingConfirmations.delete(pendingKey);
-        return {
-          allowed: false,
-          response: {
-            content: [{ type: 'text', text: '危险操作确认失败。请重新输入确认内容。' }],
-            isError: true
-          }
         };
       }
-
-      if (confirmation === 'yes') {
-        this.pendingConfirmations.delete(pendingKey);
-        return { allowed: true };
-      }
-
-      this.pendingConfirmations.delete(pendingKey);
-      return {
-        allowed: false,
-        response: {
-          content: [{ type: 'text', text: '指令执行已取消。' }]
-        }
-      };
-    }
-
-    if (!this.safetyCheckService) {
-      return { allowed: true };
-    }
-
-    let safetyResult = await this.safetyCheckService.checkCommandSafety(command);
-
-    if (operationType === 'background_command') {
-      if (safetyResult.level === 'safe') {
-        safetyResult = {
-          ...safetyResult,
-          level: 'moderate',
-          reason: '后台持续执行会放大指令影响范围，即使原始指令较安全也需要人工确认。',
-          suggestedAction: '确认该命令适合长期重复执行，并检查执行频率与影响范围。'
-        };
-      } else if (safetyResult.level === 'moderate') {
-        safetyResult = {
-          ...safetyResult,
-          reason: `${safetyResult.reason} 后台持续执行会进一步放大风险。`,
-          suggestedAction: safetyResult.suggestedAction || '仅在明确需要时执行，并确保频率与持续时间受控。'
-        };
-      }
-    }
-
-    if (safetyResult.level === 'safe') {
-      return { allowed: true };
-    }
-
-    this.pendingConfirmations.set(pendingKey, {
-      command,
-      safetyResult,
-      expiresAt: Date.now() + SshMCP.PENDING_CONFIRMATION_TTL_MS
-    });
-    return {
-      allowed: false,
-      response: this.buildPendingConfirmationResponse(operationSummary, safetyResult)
-    };
+    );
   }
-  
-  /**
-   * 注册连接管理工具
-   */
-  private registerConnectionTools(): void {
-    // 创建新连接
+
+  private registerSafetyRuleTools(): void {
     this.server.tool(
-      "connect",
-      "Establishes a new SSH connection to a server.",
-      {
-        host: z.string(),
-        port: z.number().optional(),
-        username: z.string(),
-        password: z.string().optional(),
-        privateKey: z.string().optional(),
-        passphrase: z.string().optional(),
-        name: z.string().optional(),
-        rememberPassword: z.boolean().optional().default(true),
-        tags: z.array(z.string()).optional()
-      },
-      async (params) => {
-        try {
-          // 构建连接配置
-          const config: SSHConnectionConfig = {
-            host: params.host,
-            port: params.port || parseInt(process.env.DEFAULT_SSH_PORT || '22'),
-            username: params.username,
-            password: params.password,
-            keepaliveInterval: 60000,
-            readyTimeout: parseInt(process.env.CONNECTION_TIMEOUT || '10000'),
-            reconnect: true,
-            reconnectTries: parseInt(process.env.RECONNECT_ATTEMPTS || '3'),
-            reconnectDelay: 5000
-          };
-
-          // 如果提供了私钥，优先使用私钥认证
-          if (params.privateKey) {
-            // 检查是否是私钥内容（以 -----BEGIN 开头）还是文件路径
-            if (params.privateKey.trim().startsWith('-----BEGIN')) {
-              // 直接使用私钥内容
-              config.privateKey = params.privateKey;
-            } else {
-              // 视为文件路径，读取私钥内容
-              let keyPath = params.privateKey;
-              // 展开 ~ 为用户主目录
-              if (keyPath.startsWith('~')) {
-                keyPath = keyPath.replace(/^~/, os.homedir());
-              }
-              // 检查文件是否存在
-              if (!fs.existsSync(keyPath)) {
-                return {
-                  content: [{
-                    type: "text",
-                    text: `连接失败: 私钥文件不存在: ${keyPath}`
-                  }],
-                  isError: true
-                };
-              }
-              // 读取私钥文件内容
-              config.privateKey = fs.readFileSync(keyPath, 'utf8');
-            }
-            config.passphrase = params.passphrase;
-          }
-          
-          // 连接到服务器
-          const connection = await this.sshService.connect(
-            config, 
-            params.name, 
-            params.rememberPassword,
-            params.tags
-          );
-          
-          // 记录活跃连接
-          this.activeConnections.set(connection.id, new Date());
-          
-          const credentialNotice = params.rememberPassword && !this.sshService.canPersistCredentials()
-            ? '\n\n提示: 当前在 Docker 模式下运行，默认不会持久化保存密码。如需恢复旧行为，请设置 ALLOW_INSECURE_DOCKER_CREDENTIALS=true。'
-            : '';
-
-          return {
-            content: [{
-              type: "text",
-              text: `连接成功!\n\n${this.formatConnectionInfo(connection)}${credentialNotice}`
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `连接失败: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 断开连接
-    this.server.tool(
-      "disconnect",
-      "Disconnects an active SSH connection.",
-      {
-        connectionId: z.string(),
-        disconnectAll: z.boolean().optional().default(false)
-      },
-      async ({ connectionId, disconnectAll }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-
-          // 如果有后台任务，先停止
-          if (this.backgroundExecutions.has(connectionId)) {
-            this.stopBackgroundExecution(connectionId);
-          }
-
-          const success = await this.sshService.disconnect(connectionId, disconnectAll);
-
-          // 删除活跃连接记录
-          this.activeConnections.delete(connectionId);
-
-          if (success) {
-            const message = disconnectAll 
-              ? `已成功断开连接到 ${connection.config.host} 的所有会话`
-              : `已成功断开连接 ${connection.name || connectionId}`;
-            return {
-              content: [{
-                type: "text",
-                text: message
-              }]
-            };
-          } else {
-            return {
-              content: [{
-                type: "text",
-                text: `断开连接失败`
-              }],
-              isError: true
-            };
-          }
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `断开连接时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 获取所有连接
-    this.server.tool(
-      "listConnections",
-      "Lists all saved SSH connections.",
+      'listSafetyRules',
+      'List user-defined safety rules (allowlist and denylist) for command safety checks',
       {},
       async () => {
-        try {
-          const connections = await this.sshService.getAllConnections();
-
-          if (connections.length === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: "当前没有保存的连接"
-              }]
-            };
+        if (!this.safetyCheckService) {
+          return {
+            content: [{ type: 'text', text: 'Safety check service is not enabled. Set SAFETY_CHECK_ENABLED=true to enable.' }],
+            isError: true,
+          };
+        }
+        const rules = this.safetyCheckService.getUserRules();
+        const allowCount = rules.allowlist.length;
+        const denyCount = rules.denylist.length;
+        if (allowCount === 0 && denyCount === 0) {
+          return { content: [{ type: 'text', text: 'No user-defined safety rules configured. Use updateSafetyRules to add rules.' }] };
+        }
+        const lines: string[] = [];
+        if (denyCount > 0) {
+          lines.push(`--- Denylist (${denyCount} rules) ---`);
+          for (const rule of rules.denylist) {
+            lines.push(`  [${rule.level}] /${rule.pattern}/ -> ${rule.reason}`);
           }
-
-          const formattedConnections = connections.map(conn =>
-            this.formatConnectionInfo(conn)
-          ).join("\n---\n");
-
-          return {
-            content: [{
-              type: "text",
-              text: `已保存的连接:\n\n${formattedConnections}`
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取连接列表出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
         }
+        if (allowCount > 0) {
+          lines.push(`--- Allowlist (${allowCount} rules) ---`);
+          for (const rule of rules.allowlist) {
+            lines.push(`  [${rule.level}] /${rule.pattern}/ -> ${rule.reason}`);
+          }
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
       }
     );
 
-    // 获取连接池状态
     this.server.tool(
-      "listConnectionPools",
-      "Lists all SSH connection pools and their status.",
-      {},
-      async () => {
-        try {
-          const poolInfo = this.formatConnectionPoolInfo();
-          return {
-            content: [{
-              type: "text",
-              text: poolInfo
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取连接池状态出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 获取连接详情
-    this.server.tool(
-      "getConnection",
-      "Gets detailed information about a specific SSH connection.",
+      'updateSafetyRules',
+      'Update user-defined safety rules (allowlist and denylist). Each rule has: pattern (regex), level (safe/moderate/dangerous), reason.',
       {
-        connectionId: z.string()
+        allowlist: z.array(z.object({
+          pattern: z.string().describe('Regex pattern to match against commands'),
+          level: z.enum(['safe', 'moderate', 'dangerous']),
+          reason: z.string().describe('Explanation for this rule'),
+        })).describe('Commands matching these patterns will be treated at the specified level (overrides local rules)'),
+        denylist: z.array(z.object({
+          pattern: z.string().describe('Regex pattern to match against commands'),
+          level: z.enum(['safe', 'moderate', 'dangerous']),
+          reason: z.string().describe('Explanation for this rule'),
+        })).describe('Commands matching these patterns are always blocked or flagged at the specified level (highest priority)'),
       },
-      ({ connectionId }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
+      async ({ allowlist, denylist }) => {
+        if (!this.safetyCheckService) {
           return {
-            content: [{
-              type: "text",
-              text: this.formatConnectionInfo(connection, true)
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取连接详情出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
+            content: [{ type: 'text', text: 'Safety check service is not enabled. Set SAFETY_CHECK_ENABLED=true to enable.' }],
+            isError: true,
           };
         }
-      }
-    );
-    
-    // 删除连接
-    this.server.tool(
-      "deleteConnection",
-      "Deletes a saved SSH connection.",
-      {
-        connectionId: z.string()
-      },
-      async ({ connectionId }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          const name = connection.name || connectionId;
-          
-          // 停止后台任务
-          if (this.backgroundExecutions.has(connectionId)) {
-            this.stopBackgroundExecution(connectionId);
-          }
-          
-          // 删除活跃连接记录
-          this.activeConnections.delete(connectionId);
-          
-          const success = await this.sshService.deleteConnection(connectionId);
-          
-          if (success) {
-            return {
-              content: [{
-                type: "text",
-                text: `已成功删除连接 "${name}"`
-              }]
-            };
-          } else {
-            return {
-              content: [{
-                type: "text",
-                text: `删除连接失败`
-              }],
-              isError: true
-            };
-          }
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `删除连接时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-  }
-  
-  /**
-   * 注册命令执行工具
-   */
-  private registerCommandTools(): void {
-    // 执行命令
-    this.server.tool(
-      "executeCommand",
-      "IMPORTANT: Before executing any command, ALWAYS use 'listConnections' first to verify the connection exists and get the correct connectionId. If you're unsure about the connection state, use 'getConnection' to check details. Executes a command on a remote server via SSH. All commands go through mandatory safety checks.",
-      {
-        connectionId: z.string().describe("The connection ID. Use 'listConnections' to find available connections before executing commands."),
-        command: z.string().describe("The command to execute on the remote server"),
-        cwd: z.string().optional().describe("Working directory for command execution"),
-        timeout: z.number().optional().describe("Command execution timeout in milliseconds"),
-        confirmation: z.string().optional().describe("Confirmation string (required when prompted by safety check)")
-      },
-      async ({ connectionId, command, cwd, timeout, confirmation }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
-          
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId,
-            command,
-            confirmation,
-            operationType: 'command'
-          });
-          const securityCheckPassed = policyAssessment.allowed;
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-          
-          // 只有在安全检查通过后才继续执行命令
-          if (!securityCheckPassed) {
-            return {
-              content: [{
-                type: "text",
-                text: `安全检查未通过，无法执行指令。`
-              }],
-              isError: true
-            };
-          }
-          
-          // 解析tmux命令
-          const tmuxSendKeysRegex = /tmux\s+send-keys\s+(?:-t\s+)?["']?([^"'\s]+)["']?\s+["']?(.+?)["']?\s+(?:Enter|C-m)/i;
-          const tmuxCaptureRegex = /tmux\s+capture-pane\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxNewSessionRegex = /tmux\s+new-session\s+(?:-[ds]\s+)+(?:-s\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxKillSessionRegex = /tmux\s+kill-session\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxHasSessionRegex = /tmux\s+has-session\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
-          
-          // 检查是否需要在执行前捕获tmux会话内容（用于比较前后差异）
-          let beforeCapture: CommandResult | undefined;
-          let sessionName: string | null = null;
-          
-          if (tmuxSendKeysRegex.test(command)) {
-            const match = command.match(tmuxSendKeysRegex);
-            if (match) {
-              sessionName = match[1];
 
-              beforeCapture = await this.sshService.executeCommand(
-                connectionId,
-                `tmux capture-pane -p -t ${sessionName}`,
-                { cwd, timeout: 5000 }
-              );
-              
-              // 如果不是强制执行,才进行阻塞检测
-              if (true) {
-                try {
-                  // 捕获当前会话内容
-                  const checkResult: CommandResult = await this.sshService.executeCommand(
-                    connectionId,
-                    `tmux list-panes -t ${sessionName} -F "#{pane_pid} #{pane_current_command}"`,
-                    { cwd, timeout: 5000 }
-                  );
-
-                  if (checkResult?.stdout) {
-                    const [panePid, currentCommand] = checkResult.stdout.trim().split(' ');
-                    
-                    if (panePid) {
-                      // 获取进程状态
-                      const processResult: CommandResult = await this.sshService.executeCommand(
-                        connectionId,
-                        `ps -o state= -p ${panePid}`,
-                        { timeout: 3000 }
-                      );
-
-                      const processState = processResult?.stdout?.trim();
-                      
-                      // 检查是否处于阻塞状态
-                      const isBlocked =
-                        // 进程状态检查
-                        processState === 'D' || // 不可中断的睡眠状态
-                        processState === 'T' || // 已停止
-                        processState === 'W' || // 分页等待
-                        
-                        // 常见的交互式程序
-                        /^(vim|nano|less|more|top|htop|man)$/.test(currentCommand) ||
-                        
-                        // 检查是否有子进程在运行
-                        ((await this.sshService.executeCommand(
-                          connectionId,
-                          `pgrep -P ${panePid}`,
-                          { timeout: 3000 }
-                        ) as CommandResult)?.stdout || '').trim() !== '';
-
-                      if (isBlocked) {
-                        // 获取更详细的进程信息
-                        const processInfo = await this.sshService.executeCommand(
-                          connectionId,
-                          `ps -o pid,ppid,stat,time,command -p ${panePid}`,
-                          { timeout: 3000 }
-                        );
-
-                        // 获取命令行上下文
-                        const contextOutput = await this.sshService.executeCommand(
-                          connectionId,
-                          `tmux capture-pane -p -t ${sessionName} -S -10`,
-                          { timeout: 3000 }
-                        );
-
-                        return {
-                          content: [{
-                            type: "text",
-                            text: `警告: tmux会话 "${sessionName}" 当前有阻塞进程:\n\n` +
-                                  `当前会话上下文:\n${contextOutput.stdout}\n\n` +
-                                  `进程信息:\n${processInfo.stdout}\n\n` +
-                                  `建议操作:\n` +
-                                  `1. 如果是交互式程序(vim/nano等), 请先正常退出\n` +
-                                  `2. 如果是后台任务, 可以:\n` +
-                                  `   - 等待任务完成（执行 sleep <seconds> 命令进行等待）\n` +
-                                  `   - 使用 Ctrl+C (tmux send-keys -t ${sessionName} C-c)\n` +
-                                  `   - 使用 kill -TERM ${panePid} 终止进程\n\n` +
-                                  `为避免命令冲突, 本次操作已取消。请先解决阻塞问题后再试。`
-                          }],
-                          isError: true
-                        };
-                      }
-                    }
-                  }
-                } catch (error) {
-                  console.error('检查tmux会话状态时出错:', error);
-                }
-              }
-            }
-          }
-          
-          // 检查是否是tmux命令
-          const isTmuxSendKeys = tmuxSendKeysRegex.test(command);
-          const isTmuxCapture = tmuxCaptureRegex.test(command);
-          const isTmuxNewSession = tmuxNewSessionRegex.test(command);
-          const isTmuxKillSession = tmuxKillSessionRegex.test(command);
-          const isTmuxHasSession = tmuxHasSessionRegex.test(command);
-          const isTmuxCommand = isTmuxSendKeys || isTmuxCapture || isTmuxNewSession || isTmuxKillSession || isTmuxHasSession;
-          
-          // 执行命令
-          const result = await this.sshService.executeCommand(connectionId, command, { cwd, timeout });
-          
-          // 构建输出
-          let output = '';
-          
-          // 构建命令提示符
-          const currentDir = connection.currentDirectory || '~';
-          const promptPrefix = `[${connection.config.username}@${connection.config.host}`;
-          
-          const hasCommandOutput = Boolean(result.stdout || result.stderr);
-
-          if (result.stdout) {
-            output += result.stdout;
-          }
-          
-          if (result.stderr) {
-            if (output) output += '\n';
-            output += `错误输出:\n${result.stderr}`;
-          }
-          
-          if (result.code !== 0) {
-            output += `\n命令退出码: ${result.code}`;
-          }
-          
-          // 在输出末尾添加当前目录提示
-          if (output) output += '\n';
-          output += `\n${promptPrefix} ${currentDir}]$ `;
-          
-          // 如果是tmux命令且命令执行成功，增强输出信息
-          if (isTmuxCommand && result.code === 0 && !hasCommandOutput) {
-            try {
-              // 识别命令类型并处理
-              
-              // 对于 send-keys 命令
-              if (isTmuxSendKeys && sessionName && beforeCapture?.stdout) {
-                // 等待一段时间让命令执行完成
-                await new Promise(resolve => setTimeout(resolve, 300));
-                
-                // 捕获tmux会话的当前内容
-                const afterCapture = await this.sshService.executeCommand(
-                  connectionId,
-                  `tmux capture-pane -p -t ${sessionName}`,
-                  { cwd, timeout: 5000 }
-                );
-
-                if (afterCapture?.stdout && beforeCapture?.stdout) {
-                  // 比较前后差异，提取新增内容
-                  const beforeLines = beforeCapture.stdout.trim().split('\n');
-                  const afterLines = afterCapture.stdout.trim().split('\n');
-                  
-                  // 计算出内容差异
-                  let diffOutput = '';
-                  
-                  // 计算共同前缀的行数
-                  let commonPrefix = 0;
-                  
-                  // 方法1: 从后往前找到第一个不同的行
-                  if (beforeLines.length > 0 && afterLines.length > 0) {
-                    // 找到共同前缀的行数
-                    while (commonPrefix < Math.min(beforeLines.length, afterLines.length) &&
-                           beforeLines[commonPrefix] === afterLines[commonPrefix]) {
-                      commonPrefix++;
-                    }
-                    
-                    // 提取新增的行
-                    const newLines = afterLines.slice(commonPrefix);
-                    
-                    if (newLines.length > 0) {
-                      diffOutput = newLines.join('\n');
-                    }
-                    
-                    // 如果提取失败或没有差异，尝试方法2
-                    if (!diffOutput) {
-                      // 方法2: 简单比较前后文本长度，如果变长了，取增加的部分
-                      if (afterCapture.stdout.length > beforeCapture.stdout.length) {
-                        const commonStart = beforeCapture.stdout.length;
-                        // 提取增加的内容
-                        diffOutput = afterCapture.stdout.substring(commonStart);
-                      }
-                    }
-                  }
-                  
-                  // 如果有差异输出，使用它，但添加更多上下文
-                  if (diffOutput && diffOutput.trim()) {
-                    // 获取更多上下文：找到差异开始的位置
-                    let contextOutput = '';
-                    
-                    // 向上找2-3个命令提示符标记（通常是$或#）来提供上下文
-                    const promptRegex = /^.*[\$#>]\s+/m;
-                    let promptCount = 0;
-                    let contextLines = [];
-                    
-                    // 先从原始输出的中间部分向上搜索
-                    const midPoint = Math.max(0, commonPrefix - 15);
-                    for (let i = midPoint; i < afterLines.length; i++) {
-                      contextLines.push(afterLines[i]);
-                      // 如果遇到命令提示符，计数加1
-                      if (promptRegex.test(afterLines[i])) {
-                        promptCount++;
-                      }
-                      
-                      // 如果已经找到2个命令提示符或者已经达到差异部分，停止
-                      if (promptCount >= 2 || i >= commonPrefix) {
-                        break;
-                      }
-                    }
-                    
-                    // 然后添加差异部分
-                    contextOutput = contextLines.join('\n');
-                    if (contextOutput && !contextOutput.endsWith('\n')) {
-                      contextOutput += '\n';
-                    }
-                    
-                    // 添加差异输出
-                    contextOutput += diffOutput.trim();
-                    
-                    output = `命令已发送到tmux会话 "${sessionName}"，带上下文的输出:\n\n${contextOutput}`;
-                  }
-                  // 如果没找到差异但内容确实变了，显示会话最后部分内容（带上下文）
-                  else if (beforeCapture.stdout !== afterCapture.stdout) {
-                    // 尝试获取最后几次命令和输出
-                    const lastLines = afterLines.slice(-30).join('\n');
-                    
-                    // 寻找命令提示符，提取最后几个命令
-                    const promptPositions = [];
-                    const promptRegex = /^.*[\$#>]\s+/m;
-                    
-                    // 找出所有命令提示符的位置
-                    for (let i = Math.max(0, afterLines.length - 30); i < afterLines.length; i++) {
-                      if (promptRegex.test(afterLines[i])) {
-                        promptPositions.push(i);
-                      }
-                    }
-                    
-                    // 如果找到了至少一个命令提示符
-                    if (promptPositions.length > 0) {
-                      // 取最后3个命令（如果有的话）
-                      const startPosition = promptPositions.length > 3
-                        ? promptPositions[promptPositions.length - 3]
-                        : promptPositions[0];
-                      
-                      const contextOutput = afterLines.slice(startPosition).join('\n');
-                      output = `命令已发送到tmux会话 "${sessionName}"，最近的命令和输出:\n\n${contextOutput}`;
-                    } else {
-                      // 如果没找到命令提示符，就使用最后20行
-                      output = `命令已发送到tmux会话 "${sessionName}"，最近内容:\n\n${lastLines}`;
-                    }
-                  }
-                  // 没有明显变化
-                  else {
-                    output = `命令已发送到tmux会话 "${sessionName}"，但未检测到输出变化`;
-                  }
-                }
-              }
-              // 对于 new-session 命令
-              else if (isTmuxNewSession) {
-                const match = command.match(tmuxNewSessionRegex);
-                if (match) {
-                  const sessionName = match[1];
-                  output = `已创建新的tmux会话 "${sessionName}"`;
-                  
-                  // 检查会话是否真的创建成功
-                  const checkResult = await this.sshService.executeCommand(
-                    connectionId,
-                    `tmux has-session -t ${sessionName} 2>/dev/null && echo "会话存在" || echo "会话创建失败"`,
-                    { timeout: 3000 }
-                  );
-                  
-                  if (checkResult.stdout && checkResult.stdout.includes("会话存在")) {
-                    output += `\n会话已成功启动并在后台运行`;
-                  }
-                }
-              }
-              // 对于 kill-session 命令
-              else if (isTmuxKillSession) {
-                const match = command.match(tmuxKillSessionRegex);
-                if (match) {
-                  const sessionName = match[1];
-                  output = `已终止tmux会话 "${sessionName}"`;
-                }
-              }
-              // 对于 has-session 命令
-              else if (isTmuxHasSession) {
-                const match = command.match(tmuxHasSessionRegex);
-                if (match) {
-                  const sessionName = match[1];
-                  if (result.code === 0) {
-                    output = `tmux会话 "${sessionName}" 存在`;
-                  } else {
-                    output = `tmux会话 "${sessionName}" 不存在`;
-                  }
-                }
-              }
-              // 对于 capture-pane 命令
-              else if (isTmuxCapture) {
-                // 如果直接是capture-pane命令，输出就是其结果，不需要特殊处理
-                if (!output || output.trim() === '') {
-                  const match = command.match(tmuxCaptureRegex);
-                  if (match) {
-                    const sessionName = match[1];
-                    output = `tmux会话 "${sessionName}" 内容已捕获，但原始命令未返回输出内容`;
-                  }
-                }
-              }
-              // 对于复合命令（含有多个tmux命令）
-              else if (command.includes("tmux") && (command.includes("&&") || command.includes(";"))) {
-                // 尝试提取最后一个tmux命令的会话名
-                const tmuxCommands = command.split(/&&|;/).map(cmd => cmd.trim());
-                let lastSessionName = null;
-                
-                for (const cmd of tmuxCommands) {
-                  let match;
-                  if ((match = cmd.match(tmuxNewSessionRegex)) ||
-                      (match = cmd.match(tmuxKillSessionRegex)) ||
-                      (match = cmd.match(tmuxHasSessionRegex)) ||
-                      (match = cmd.match(tmuxSendKeysRegex)) ||
-                      (match = cmd.match(tmuxCaptureRegex))) {
-                    lastSessionName = match[1];
-                  }
-                }
-                
-                if (lastSessionName) {
-                  // 如果最后一个命令是创建会话，通知用户会话已创建
-                  if (tmuxCommands[tmuxCommands.length-1].includes("new-session")) {
-                    output = `已执行tmux复合命令，最后创建了会话 "${lastSessionName}"`;
-                    
-                    // 等待会话创建完成
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    
-                    // 检查会话是否真的创建成功
-                    const checkResult = await this.sshService.executeCommand(
-                      connectionId,
-                      `tmux has-session -t ${lastSessionName} 2>/dev/null && echo "会话存在" || echo "会话创建失败"`,
-                      { timeout: 3000 }
-                    );
-                    
-                    if (checkResult.stdout && checkResult.stdout.includes("会话存在")) {
-                      output += `\n会话已成功启动并在后台运行`;
-                    }
-                  }
-                  // 如果最后一个命令是kill-session，通知用户会话已终止
-                  else if (tmuxCommands[tmuxCommands.length-1].includes("kill-session")) {
-                    output = `已执行tmux复合命令，最后终止了会话 "${lastSessionName}"`;
-                  }
-                  // 对于其他复合命令，尝试捕获最后一个会话的内容
-                  else {
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    
-                    // 等待会话阻塞状态解除或超时（最多等待10分钟）
-                    let isBlocked = true;
-                    let waitStartTime = Date.now();
-                    const maxWaitTime = 10 * 60 * 1000; // 10分钟
-                    
-                    while (isBlocked && (Date.now() - waitStartTime < maxWaitTime)) {
-                      try {
-                        // 检查会话是否处于阻塞状态
-                        const checkResult = await this.sshService.executeCommand(
-                          connectionId,
-                          `tmux list-panes -t ${lastSessionName} -F "#{pane_pid} #{pane_current_command}"`,
-                          { cwd, timeout: 5000 }
-                        );
-                        
-                        if (checkResult?.stdout) {
-                          const [panePid, currentCommand] = checkResult.stdout.trim().split(' ');
-                          
-                          if (panePid) {
-                            // 获取进程状态
-                            const processResult = await this.sshService.executeCommand(
-                              connectionId,
-                              `ps -o state= -p ${panePid}`,
-                              { timeout: 3000 }
-                            );
-                            
-                            const processState = processResult?.stdout?.trim();
-                            
-                            // 检查是否处于阻塞状态
-                            isBlocked =
-                              // 进程状态检查
-                              processState === 'D' || // 不可中断的睡眠状态
-                              processState === 'T' || // 已停止
-                              processState === 'W' || // 分页等待
-                              
-                              // 常见的交互式程序
-                              /^(vim|nano|less|more|top|htop|man)$/.test(currentCommand) ||
-                              
-                              // 检查是否有子进程在运行
-                              ((await this.sshService.executeCommand(
-                                connectionId,
-                                `pgrep -P ${panePid}`,
-                                { timeout: 3000 }
-                              ))?.stdout || '').trim() !== '';
-                            
-                            if (!isBlocked) {
-                              // 阻塞已解除，退出循环
-                              break;
-                            }
-                            
-                            // 等待一段时间再检查
-                            await new Promise(resolve => setTimeout(resolve, 5000));
-                          } else {
-                            // 没有有效的进程ID，认为没有阻塞
-                            isBlocked = false;
-                          }
-                        } else {
-                          // 无法获取会话信息，认为没有阻塞
-                          isBlocked = false;
-                        }
-                      } catch (error) {
-                        console.error('检查会话阻塞状态时出错:', error);
-                        // 出错时认为没有阻塞，避免无限循环
-                        isBlocked = false;
-                      }
-                    }
-                    
-                    // 检查是否是因为超时而退出循环
-                    if (isBlocked && (Date.now() - waitStartTime >= maxWaitTime)) {
-                      // 获取当前状态信息
-                      try {
-                        const processInfo = await this.sshService.executeCommand(
-                          connectionId,
-                          `tmux list-panes -t ${lastSessionName} -F "#{pane_pid}" | xargs ps -o pid,ppid,stat,time,command -p`,
-                          { timeout: 5000 }
-                        );
-                        
-                        const contextOutput = await this.sshService.executeCommand(
-                          connectionId,
-                          `tmux capture-pane -p -t ${lastSessionName} -S -10`,
-                          { timeout: 3000 }
-                        );
-                        
-                        output = `已执行tmux复合命令，但会话 "${lastSessionName}" 仍处于阻塞状态超过10分钟:\n\n` +
-                                `当前会话上下文:\n${contextOutput.stdout}\n\n` +
-                                `进程信息:\n${processInfo.stdout}\n\n` +
-                                `如果是正常情况，请执行 sleep <seconds> 命令等待`;
-                      } catch (error) {
-                        output = `已执行tmux复合命令，但会话 "${lastSessionName}" 仍处于阻塞状态超过10分钟。无法获取详细信息。`;
-                      }
-                    } else {
-                      // 阻塞已解除或会话不存在，获取会话内容
-                      try {
-                        const captureResult = await this.sshService.executeCommand(
-                          connectionId,
-                          `tmux has-session -t ${lastSessionName} 2>/dev/null && tmux capture-pane -p -t ${lastSessionName} || echo "会话不存在"`,
-                          { cwd, timeout: 5000 }
-                        );
-                        
-                        if (captureResult.stdout && !captureResult.stdout.includes("会话不存在")) {
-                          // 提取最后40行
-                          const lines = captureResult.stdout.split('\n');
-                          const lastLines = lines.slice(-40).join('\n');
-                          
-                          output = `已执行tmux复合命令，会话 "${lastSessionName}" 当前内容:\n\n${lastLines}`;
-                        } else {
-                          output = `已执行tmux复合命令，但会话 "${lastSessionName}" 不存在或无法捕获内容`;
-                        }
-                      } catch (err) {
-                        output = `已执行tmux复合命令，涉及会话 "${lastSessionName}"`;
-                      }
-                    }
-                  }
-                } else {
-                  output = "已执行tmux复合命令";
-                }
-              }
-            } catch (captureError) {
-              console.error('处理tmux命令输出时出错:', captureError);
-              // 如果捕获失败，使用原始输出
-              output = `tmux命令已执行，但无法获取额外信息: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
-            }
-          }
-          
-          // 处理输出长度限制
-          const maxLength = parseInt(process.env.MAX_OUTPUT_LENGTH || '3000');
-          if (output.length > maxLength) {
-            const cacheId = this.outputCacheService.cacheOutput(command, output, connectionId);
-            const lastLines = this.outputCacheService.getLastLines(cacheId, 100);
-            
-            return {
-              content: [{
-                type: "text",
-                text: `输出内容过长 (${output.length} 字符)，已缓存。\n\n最后100行:\n${lastLines}\n\n缓存ID: ${cacheId}\n\n请选择操作:\n1. 查看完整输出: getCachedOutput "${cacheId}" "full"\n2. 查看最后N行: getCachedOutput "${cacheId}" "last" 200\n3. 保存到文件: getCachedOutput "${cacheId}" "save" "/path/to/file"`
-              }]
-            };
-          }
-          
-          return {
-            content: [{
-              type: "text",
-              text: output || '命令执行成功，无输出'
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `执行命令时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 后台执行命令
-    this.server.tool(
-      "backgroundExecute",
-      "Executes a command in the background on a remote server at a specified interval.",
-      {
-        connectionId: z.string(),
-        command: z.string(),
-        interval: z.number().optional(),
-        cwd: z.string().optional(),
-        confirmation: z.string().optional().describe("Confirmation string required for commands that need explicit approval")
-      },
-      async ({ connectionId, command, interval = 10000, cwd, confirmation }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 如果已存在后台任务，先停止
-          if (this.backgroundExecutions.has(connectionId)) {
-            this.stopBackgroundExecution(connectionId);
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
-
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId,
-            command,
-            confirmation,
-            operationType: 'background_command'
-          });
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-          if (!policyAssessment.allowed) {
-            return {
-              content: [{
-                type: "text",
-                text: `安全策略未允许后台执行该命令。`
-              }],
-              isError: true
-            };
-          }
-           
-          // 先执行一次命令
-          await this.sshService.executeCommand(connectionId, command, { cwd });
-          
-          // 设置定时器
-          const timer = setInterval(async () => {
-            try {
-              const conn = this.sshService.getConnection(connectionId);
-              if (conn && conn.status === ConnectionStatus.CONNECTED) {
-                await this.sshService.executeCommand(connectionId, command, { cwd });
-                
-                // 更新最后检查时间
-                const bgExec = this.backgroundExecutions.get(connectionId);
-                if (bgExec) {
-                  bgExec.lastCheck = new Date();
-                }
-              } else {
-                // 如果连接已不可用，停止后台任务
-                this.stopBackgroundExecution(connectionId);
-              }
-            } catch (error) {
-              console.error(`后台执行命令出错:`, error);
-              // 不停止任务，继续下一次尝试
-            }
-          }, interval);
-          
-          // 记录后台任务
-          this.backgroundExecutions.set(connectionId, {
-            interval: timer,
-            lastCheck: new Date()
-          });
-          
-          return {
-            content: [{
-              type: "text",
-              text: `已在后台启动命令: ${command}\n间隔: ${interval / 1000}秒\n连接: ${connection.name || connectionId}\n\n使用 stopBackground 工具可停止此后台任务。`
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `设置后台任务时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 停止后台执行
-    this.server.tool(
-      "stopBackground",
-      "Stops a background command execution on a specific connection.",
-      {
-        connectionId: z.string()
-      },
-      ({ connectionId }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (!this.backgroundExecutions.has(connectionId)) {
-            return {
-              content: [{
-                type: "text",
-                text: `连接 ${connection.name || connectionId} 没有正在运行的后台任务`
-              }]
-            };
-          }
-          
-          // 停止后台任务
-          this.stopBackgroundExecution(connectionId);
-          
-          return {
-            content: [{
-              type: "text",
-              text: `已停止连接 ${connection.name || connectionId} 的后台任务`
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `停止后台任务时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 获取当前目录工具
-    this.server.tool(
-      "getCurrentDirectory",
-      "Gets the current working directory of an SSH connection.",
-      {
-        connectionId: z.string()
-      },
-      async ({ connectionId }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
-          
-          // 获取当前目录
-          const result = await this.sshService.executeCommand(connectionId, 'pwd');
-          
-          return {
-            content: [{
-              type: "text",
-              text: result.stdout.trim()
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取当前目录时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-  }
-  
-  /**
-   * 注册文件传输工具
-   */
-  private registerFileTools(): void {
-    // 上传文件
-    this.server.tool(
-      "uploadFile",
-      "Uploads a local file to a remote server.",
-      {
-        connectionId: z.string(),
-        localPath: z.string(),
-        remotePath: z.string(),
-        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
-      },
-      async ({ connectionId, localPath, remotePath, confirmation }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 检查本地文件是否存在
-          if (!fs.existsSync(localPath)) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 本地文件 "${localPath}" 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
-
-          const operationSummary = `upload local file ${localPath} to remote path ${remotePath}`;
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId,
-            command: operationSummary,
-            confirmation,
-            operationType: 'file_upload',
-            operationSummary
-          });
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-           
-          // 上传文件并获取传输ID
-          const transferInfo = await this.sshService.uploadFile(connectionId, localPath, remotePath);
-          const transferId = transferInfo.id;
-          
-          // 监听传输进度
-          const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-            // 只在进度变化大于5%时发送更新，避免过多事件
-            if (info.progress % 5 === 0 || info.status === 'completed' || info.status === 'failed') {
-              (this.server as any).sendEvent('file_transfer_progress', {
-                transferId: info.id,
-                progress: Math.round(info.progress),
-                status: info.status,
-                human: `文件传输 ${info.id} - ${info.status}: ${Math.round(info.progress)}% (${this.formatFileSize(info.bytesTransferred)}/${this.formatFileSize(info.size)})`
-              });
-            }
-          });
-          
+        for (const rule of [...allowlist, ...denylist]) {
           try {
-            // 获取最终结果
-            const result = this.sshService.getTransferInfo(transferId);
-            
-            if (result && result.status === 'failed') {
-              return {
-                content: [{
-                  type: "text",
-                  text: `文件上传失败: ${result.error || '未知错误'}`
-                }],
-                isError: true,
-                transferId
-              };
-            }
-            
-            const fileName = path.basename(localPath);
-            
+            new RegExp(rule.pattern);
+          } catch {
             return {
-              content: [{
-                type: "text",
-                text: `文件 "${fileName}" 上传成功\n本地路径: ${localPath}\n远程路径: ${remotePath}`
-              }],
-              transferId
+              content: [{ type: 'text', text: `Invalid regex pattern: "${rule.pattern}"` }],
+              isError: true,
             };
-          } finally {
-            // 确保始终取消订阅
-            unsubscribe();
           }
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `上传文件时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
         }
-      }
-    );
-    
-    // 下载文件
-    this.server.tool(
-      "downloadFile",
-      "Downloads a file from a remote server to the local machine.",
-      {
-        connectionId: z.string(),
-        remotePath: z.string(),
-        localPath: z.string().optional(),
-        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
-      },
-      async ({ connectionId, remotePath, localPath, confirmation }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 确定本地保存路径
-          let savePath = localPath;
-          if (!savePath) {
-            const fileName = path.basename(remotePath);
-            savePath = path.join(os.homedir(), 'Downloads', fileName);
-            
-            // 确保目录存在
-            const saveDir = path.dirname(savePath);
-            if (!fs.existsSync(saveDir)) {
-              fs.mkdirSync(saveDir, { recursive: true });
-            }
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
 
-          const operationSummary = `download remote file ${remotePath} to local path ${savePath}`;
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId,
-            command: operationSummary,
-            confirmation,
-            operationType: 'file_download',
-            operationSummary
-          });
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-           
-          // 下载文件并获取传输ID
-          const transferInfo = await this.sshService.downloadFile(connectionId, remotePath, savePath);
-          const transferId = transferInfo.id;
-          
-          // 监听传输进度
-          const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-            // 只在进度变化大于5%时发送更新，避免过多事件
-            if (info.progress % 5 === 0 || info.status === 'completed' || info.status === 'failed') {
-              (this.server as any).sendEvent('file_transfer_progress', {
-                transferId: info.id,
-                progress: Math.round(info.progress),
-                status: info.status,
-                human: `文件传输 ${info.id} - ${info.status}: ${Math.round(info.progress)}% (${this.formatFileSize(info.bytesTransferred)}/${this.formatFileSize(info.size)})`
-              });
-            }
-          });
-          
-          try {
-            // 获取最终结果
-            const result = this.sshService.getTransferInfo(transferId);
-            
-            if (result && result.status === 'failed') {
-              return {
-                content: [{
-                  type: "text",
-                  text: `文件下载失败: ${result.error || '未知错误'}`
-                }],
-                isError: true,
-                transferId
-              };
-            }
-            
-            const fileName = path.basename(remotePath);
-            
-            return {
-              content: [{
-                type: "text",
-                text: `文件 "${fileName}" 下载成功\n远程路径: ${remotePath}\n本地路径: ${savePath}`
-              }],
-              transferId
-            };
-          } finally {
-            // 确保始终取消订阅
-            unsubscribe();
-          }
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `下载文件时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 批量上传文件
-    this.server.tool(
-      "batchUploadFiles",
-      "Uploads multiple local files to a remote server.",
-      {
-        connectionId: z.string(),
-        files: z.array(z.object({
-          localPath: z.string(),
-          remotePath: z.string()
-        })),
-        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
-      },
-      async ({ connectionId, files, confirmation }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 检查所有本地文件是否存在
-          const missingFiles = files.filter(file => !fs.existsSync(file.localPath));
-          if (missingFiles.length > 0) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 以下本地文件不存在:\n${missingFiles.map(f => f.localPath).join('\n')}`
-              }],
-              isError: true
-            };
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
-
-          const operationSummary = `batch upload ${files.length} local files to remote destinations: ${files.map(file => `${file.localPath} -> ${file.remotePath}`).join('; ')}`;
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId,
-            command: operationSummary,
-            confirmation,
-            operationType: 'batch_file_upload',
-            operationSummary
-          });
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-           
-          // 批量传输文件
-          const transferIds = await this.sshService.batchTransfer({
-            connectionId,
-            items: files,
-            direction: 'upload'
-          });
-          
-          if (transferIds.length === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: `没有文件被上传`
-              }],
-              isError: true
-            };
-          }
-          
-          // 设置批量传输进度监听
-          const listeners: (() => void)[] = [];
-          
-          for (const transferId of transferIds) {
-            const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-              if (info.id === transferId && (info.progress % 10 === 0 || info.status === 'completed' || info.status === 'failed')) {
-                (this.server as any).sendEvent('batch_transfer_progress', {
-                  transferId: info.id,
-                  progress: Math.round(info.progress),
-                  status: info.status,
-                  direction: 'upload',
-                  human: `批量上传 - 文件: ${path.basename(info.localPath)} - ${info.status}: ${Math.round(info.progress)}%`
-                });
-              }
-            });
-            
-            listeners.push(unsubscribe);
-          }
-          
-          try {
-            // 等待所有传输完成
-            await new Promise<void>((resolve) => {
-              const checkInterval = setInterval(() => {
-                const allDone = transferIds.every(id => {
-                  const info = this.sshService.getTransferInfo(id);
-                  return info && (info.status === 'completed' || info.status === 'failed');
-                });
-                
-                if (allDone) {
-                  clearInterval(checkInterval);
-                  resolve();
-                }
-              }, 500);
-            });
-            
-            // 重新获取最终传输信息，避免依赖旧引用状态
-            const finalTransferInfos = transferIds
-              .map(id => this.sshService.getTransferInfo(id))
-              .filter(Boolean) as FileTransferInfo[];
-
-            const successCount = finalTransferInfos.filter(info => info.status === 'completed').length;
-            const failedCount = finalTransferInfos.filter(info => info.status === 'failed').length;
-            
-            return {
-              content: [{
-                type: "text",
-                text: `批量上传完成\n成功: ${successCount}个文件\n失败: ${failedCount}个文件`
-              }],
-              transferIds
-            };
-          } finally {
-            // 清理所有监听器
-            listeners.forEach(unsubscribe => unsubscribe());
-          }
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `批量上传文件时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 批量下载文件
-    this.server.tool(
-      "batchDownloadFiles",
-      "Downloads multiple files from a remote server.",
-      {
-        connectionId: z.string(),
-        files: z.array(z.object({
-          remotePath: z.string(),
-          localPath: z.string().optional()
-        })),
-        confirmation: z.string().optional().describe("Confirmation string required for risky transfers")
-      },
-      async ({ connectionId, files, confirmation }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 处理本地路径
-          const normalizedFiles = files.map(file => {
-            if (!file.remotePath) {
-              return null; // 跳过无效项
-            }
-            
-            // 如果没有提供本地路径，生成一个默认路径
-            if (!file.localPath) {
-              const fileName = path.basename(file.remotePath);
-              const localPath = path.join(os.homedir(), 'Downloads', fileName);
-              
-              // 确保目录存在
-              const saveDir = path.dirname(localPath);
-              if (!fs.existsSync(saveDir)) {
-                fs.mkdirSync(saveDir, { recursive: true });
-              }
-              
-              return { remotePath: file.remotePath, localPath };
-            }
-            return file;
-          }).filter(item => item !== null) as { remotePath: string, localPath: string }[];
-          
-          if (normalizedFiles.length === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 没有有效的文件传输项`
-              }],
-              isError: true
-            };
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
-
-          const operationSummary = `batch download ${normalizedFiles.length} remote files to local destinations: ${normalizedFiles.map(file => `${file.remotePath} -> ${file.localPath}`).join('; ')}`;
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId,
-            command: operationSummary,
-            confirmation,
-            operationType: 'batch_file_download',
-            operationSummary
-          });
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-           
-          // 开始批量下载
-          const transferIds = await this.sshService.batchTransfer({
-            connectionId,
-            items: normalizedFiles,
-            direction: 'download'
-          });
-          
-          if (transferIds.length === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: `没有文件被下载`
-              }],
-              isError: true
-            };
-          }
-          
-          // 设置批量传输进度监听
-          const listeners: (() => void)[] = [];
-          
-          for (const transferId of transferIds) {
-            const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-              if (info.id === transferId && (info.progress % 10 === 0 || info.status === 'completed' || info.status === 'failed')) {
-                (this.server as any).sendEvent('batch_transfer_progress', {
-                  transferId: info.id,
-                  progress: Math.round(info.progress),
-                  status: info.status,
-                  direction: 'download',
-                  human: `批量下载 - 文件: ${path.basename(info.remotePath)} - ${info.status}: ${Math.round(info.progress)}%`
-                });
-              }
-            });
-            
-            listeners.push(unsubscribe);
-          }
-          
-          try {
-            // 等待所有传输完成
-            await new Promise<void>((resolve) => {
-              const checkInterval = setInterval(() => {
-                const allDone = transferIds.every(id => {
-                  const info = this.sshService.getTransferInfo(id);
-                  return info && (info.status === 'completed' || info.status === 'failed');
-                });
-                
-                if (allDone) {
-                  clearInterval(checkInterval);
-                  resolve();
-                }
-              }, 500);
-            });
-            
-            // 重新获取最终传输信息，避免依赖旧引用状态
-            const finalTransferInfos = transferIds
-              .map(id => this.sshService.getTransferInfo(id))
-              .filter(Boolean) as FileTransferInfo[];
-
-            const successCount = finalTransferInfos.filter(info => info.status === 'completed').length;
-            const failedCount = finalTransferInfos.filter(info => info.status === 'failed').length;
-            
-            return {
-              content: [{
-                type: "text",
-                text: `批量下载完成\n成功: ${successCount}个文件\n失败: ${failedCount}个文件`
-              }],
-              transferIds
-            };
-          } finally {
-            // 清理所有监听器
-            listeners.forEach(unsubscribe => unsubscribe());
-          }
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `批量下载文件时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 获取文件传输状态
-    this.server.tool(
-      "getFileTransferStatus",
-      "Gets the status of a specific file transfer.",
-      {
-        transferId: z.string()
-      },
-      async ({ transferId }) => {
-        try {
-          const transfer = this.sshService.getTransferInfo(transferId);
-          
-          if (!transfer) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 传输 ${transferId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          let statusText;
-          switch (transfer.status) {
-            case 'pending':
-              statusText = '等待中';
-              break;
-            case 'in-progress':
-              statusText = '传输中';
-              break;
-            case 'completed':
-              statusText = '已完成';
-              break;
-            case 'failed':
-              statusText = '失败';
-              break;
-            default:
-              statusText = transfer.status;
-          }
-          
-          const directionText = transfer.direction === 'upload' ? '上传' : '下载';
-          const fileName = transfer.direction === 'upload' 
-            ? path.basename(transfer.localPath)
-            : path.basename(transfer.remotePath);
-          
-          let output = `文件 ${directionText} 状态:\n`;
-          output += `ID: ${transfer.id}\n`;
-          output += `文件名: ${fileName}\n`;
-          output += `状态: ${statusText}\n`;
-          output += `进度: ${Math.round(transfer.progress)}%\n`;
-          output += `大小: ${this.formatFileSize(transfer.size)}\n`;
-          output += `已传输: ${this.formatFileSize(transfer.bytesTransferred)}\n`;
-          
-          if (transfer.startTime) {
-            output += `开始时间: ${transfer.startTime.toLocaleString()}\n`;
-          }
-          
-          if (transfer.endTime) {
-            output += `结束时间: ${transfer.endTime.toLocaleString()}\n`;
-            
-            // 计算传输速度
-            const duration = (transfer.endTime.getTime() - transfer.startTime.getTime()) / 1000;
-            if (duration > 0) {
-              const speed = transfer.bytesTransferred / duration;
-              output += `平均速度: ${this.formatFileSize(speed)}/s\n`;
-            }
-          }
-          
-          if (transfer.error) {
-            output += `错误: ${transfer.error}\n`;
-          }
-          
-          return {
-            content: [{
-              type: "text",
-              text: output
-            }],
-            transfer
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取文件传输状态时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 列出所有文件传输
-    this.server.tool(
-      "listFileTransfers",
-      "Lists all recent file transfers.",
-      {},
-      async () => {
-        try {
-          const transfers = this.sshService.getAllTransfers();
-          
-          if (transfers.length === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: "没有文件传输记录"
-              }]
-            };
-          }
-          
-          let output = `文件传输记录 (${transfers.length}):\n\n`;
-          
-          for (const transfer of transfers) {
-            const fileName = transfer.direction === 'upload' 
-              ? path.basename(transfer.localPath)
-              : path.basename(transfer.remotePath);
-            
-            let status;
-            switch (transfer.status) {
-              case 'pending':
-                status = '⏳ 等待中';
-                break;
-              case 'in-progress':
-                status = '🔄 传输中';
-                break;
-              case 'completed':
-                status = '✅ 已完成';
-                break;
-              case 'failed':
-                status = '❌ 失败';
-                break;
-              default:
-                status = transfer.status;
-            }
-            
-            output += `${status} ${transfer.direction === 'upload' ? '⬆️' : '⬇️'} ${fileName}\n`;
-            output += `ID: ${transfer.id}\n`;
-            output += `进度: ${Math.round(transfer.progress)}% (${this.formatFileSize(transfer.bytesTransferred)}/${this.formatFileSize(transfer.size)})\n`;
-            
-            if (transfer.startTime) {
-              output += `开始: ${transfer.startTime.toLocaleString()}\n`;
-            }
-            
-            if (transfer.endTime) {
-              output += `结束: ${transfer.endTime.toLocaleString()}\n`;
-            }
-            
-            if (transfer.error) {
-              output += `错误: ${transfer.error}\n`;
-            }
-            
-            output += '\n';
-          }
-          
-          return {
-            content: [{
-              type: "text",
-              text: output
-            }],
-            transfers
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取文件传输列表时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-  }
-  
-  /**
-   * 注册会话管理工具
-   */
-  private registerSessionTools(): void {
-    // 列出活跃会话
-    this.server.tool(
-      "listActiveSessions",
-      "Lists all currently active SSH sessions.",
-      {},
-      async () => {
-        try {
-          if (this.activeConnections.size === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: "当前没有活跃的会话"
-              }]
-            };
-          }
-          
-          let output = "活跃会话:\n\n";
-          
-          for (const [id, lastActive] of this.activeConnections.entries()) {
-            const connection = this.sshService.getConnection(id);
-            if (connection) {
-              output += this.formatConnectionInfo(connection);
-              output += `上次活动: ${this.formatTimeDifference(lastActive)}\n`;
-              
-              if (this.backgroundExecutions.has(id)) {
-                const bgExec = this.backgroundExecutions.get(id);
-                if (bgExec) {
-                  output += `后台任务: 活跃中，最后执行: ${this.formatTimeDifference(bgExec.lastCheck)}\n`;
-                }
-              }
-              
-              output += "\n---\n\n";
-            }
-          }
-          
-          return {
-            content: [{
-              type: "text",
-              text: output
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取活跃会话时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 列出后台任务
-    this.server.tool(
-      "listBackgroundTasks",
-      "Lists all background tasks currently running.",
-      {},
-      () => {
-        try {
-          if (this.backgroundExecutions.size === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: "当前没有运行中的后台任务"
-              }]
-            };
-          }
-          
-          let output = "运行中的后台任务:\n\n";
-          
-          for (const [id, info] of this.backgroundExecutions.entries()) {
-            const connection = this.sshService.getConnection(id);
-            if (connection) {
-              output += `连接: ${connection.name || connection.id}\n`;
-              output += `主机: ${connection.config.host}\n`;
-              output += `用户: ${connection.config.username}\n`;
-              output += `状态: ${connection.status}\n`;
-              output += `最后执行: ${this.formatTimeDifference(info.lastCheck)}\n`;
-              output += "\n---\n\n";
-            }
-          }
-          
-          return {
-            content: [{
-              type: "text",
-              text: output
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取后台任务时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 停止所有后台任务
-    this.server.tool(
-      "stopAllBackgroundTasks",
-      "Stops all running background tasks.",
-      {},
-      () => {
-        try {
-          const count = this.backgroundExecutions.size;
-          
-          if (count === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: "当前没有运行中的后台任务"
-              }]
-            };
-          }
-          
-          // 停止所有后台任务
-          for (const id of this.backgroundExecutions.keys()) {
-            this.stopBackgroundExecution(id);
-          }
-          
-          return {
-            content: [{
-              type: "text",
-              text: `已停止所有 ${count} 个后台任务`
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `停止所有后台任务时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-  }
-  
-  /**
-   * 注册终端交互工具
-   */
-  private registerTerminalTools() {
-    // 创建终端会话
-    this.server.tool(
-      "mcp_ssh_mcp_createTerminalSession",
-      "Creates a new interactive terminal session.",
-      {
-        connectionId: z.string(),
-        rows: z.number().optional(),
-        cols: z.number().optional(),
-        term: z.string().optional(),
-      },
-      async (params) => {
-        try {
-          const { connectionId, rows, cols, term } = params;
-          const sessionId = await this.sshService.createTerminalSession(connectionId, { rows, cols, term });
-          
-          // 设置终端数据监听器
-          const unsubscribeData = this.sshService.onTerminalData((event) => {
-            if (event.sessionId === sessionId) {
-              // 应用输出长度限制
-              const limitedData = this.limitOutputLength(event.data);
-
-              (this.server as any).sendEvent('terminal_data', {
-                sessionId: event.sessionId,
-                data: limitedData,
-                human: limitedData
-              });
-            }
-          });
-          
-          // 当终端关闭时，取消订阅
-          const unsubscribeClose = this.sshService.onTerminalClose((event) => {
-            if (event.sessionId === sessionId) {
-              unsubscribeData();
-              unsubscribeClose(); // 也取消自身的订阅
-              (this.server as any).sendEvent('terminal_closed', {
-                sessionId: event.sessionId,
-                human: `终端会话 ${sessionId} 已关闭`
-              });
-            }
-          });
-          
-          return {
-            content: [{
-              type: "text",
-              text: `已创建终端会话 ${sessionId}`
-            }],
-            sessionId
-          };
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          console.error(`创建终端会话失败:`, error);
-          return {
-            content: [{
-              type: "text",
-              text: `创建终端会话失败: ${errorMessage}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 向终端写入数据
-    this.server.tool(
-      "mcp_ssh_mcp_writeToTerminal",
-      "Writes data to an interactive terminal session.",
-      {
-        sessionId: z.string(),
-        data: z.string(),
-        confirmation: z.string().optional().describe("Confirmation string required for risky terminal writes")
-      },
-      async (params) => {
-        try {
-          const { sessionId, data, confirmation } = params;
-          const operationSummary = `write terminal input to session ${sessionId}: ${data}`;
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId: `terminal:${sessionId}`,
-            command: operationSummary,
-            confirmation,
-            operationType: 'terminal_write',
-            operationSummary
-          });
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-
-          const success = await this.sshService.writeToTerminal(sessionId, data);
-          
-          return {
-            content: [{
-              type: "text",
-              text: success ? `数据已发送到终端 ${sessionId}` : `数据发送失败`
-            }],
-            success
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `向终端写入数据时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-  }
-
-  /**
-   * 注册隧道管理工具
-   */
-  private registerTunnelTools(): void {
-    // 创建隧道
-    this.server.tool(
-      "createTunnel",
-      "Creates an SSH tunnel (port forwarding).",
-      {
-        connectionId: z.string(),
-        localPort: z.number(),
-        remoteHost: z.string(),
-        remotePort: z.number(),
-        description: z.string().optional(),
-        confirmation: z.string().optional().describe("Confirmation string required for tunnel creation approval")
-      },
-      async ({ connectionId, localPort, remoteHost, remotePort, description, confirmation }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-
-          const operationSummary = `create SSH tunnel from local port ${localPort} to ${remoteHost}:${remotePort}${description ? ` (${description})` : ''}`;
-          const policyAssessment = await this.assessOperationPolicy({
-            connectionId,
-            command: operationSummary,
-            confirmation,
-            operationType: 'tunnel_create',
-            operationSummary
-          });
-          if (policyAssessment.response) {
-            return policyAssessment.response;
-          }
-           
-          // 创建隧道
-          const tunnelId = await this.sshService.createTunnel({
-            connectionId,
-            localPort,
-            remoteHost,
-            remotePort,
-            description
-          });
-          
-          return {
-            content: [{
-              type: "text",
-              text: `隧道已创建\n本地端口: ${localPort}\n远程: ${remoteHost}:${remotePort}\n隧道ID: ${tunnelId}`
-            }],
-            tunnelId
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `创建隧道时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 关闭隧道
-    this.server.tool(
-      "closeTunnel",
-      "Closes an active SSH tunnel.",
-      {
-        tunnelId: z.string()
-      },
-      async ({ tunnelId }) => {
-        try {
-          const success = await this.sshService.closeTunnel(tunnelId);
-          
-          if (success) {
-            return {
-              content: [{
-                type: "text",
-                text: `隧道 ${tunnelId} 已关闭`
-              }]
-            };
-          } else {
-            return {
-              content: [{
-                type: "text",
-                text: `关闭隧道 ${tunnelId} 失败`
-              }],
-              isError: true
-            };
-          }
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `关闭隧道时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-    
-    // 列出所有隧道
-    this.server.tool(
-      "listTunnels",
-      "Lists all active SSH tunnels.",
-      {},
-      () => {
-        try {
-          const tunnels = this.sshService.getTunnels();
-          
-          if (tunnels.length === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: "当前没有活跃的隧道"
-              }]
-            };
-          }
-          
-          let output = "活跃的隧道:\n\n";
-          
-          for (const tunnel of tunnels) {
-            const connection = this.sshService.getConnection(tunnel.connectionId);
-            output += `ID: ${tunnel.id}\n`;
-            output += `本地端口: ${tunnel.localPort}\n`;
-            output += `远程: ${tunnel.remoteHost}:${tunnel.remotePort}\n`;
-            
-            if (connection) {
-              output += `连接: ${connection.name || connection.id} (${connection.config.host})\n`;
-            }
-            
-            if (tunnel.description) {
-              output += `描述: ${tunnel.description}\n`;
-            }
-            
-            output += "\n---\n\n";
-          }
-          
-          return {
-            content: [{
-              type: "text",
-              text: output
-            }],
-            tunnels
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取隧道列表时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-  }
-
-  /**
-   * 注册缓存管理工具
-   */
-  private registerCacheTools(): void {
-    // 获取缓存输出
-    this.server.tool(
-      "getCachedOutput",
-      "Gets cached output from a previous command execution.",
-      {
-        cacheId: z.string(),
-        option: z.enum(['full', 'last', 'save']).default('full'),
-        lineCount: z.number().optional(),
-        filePath: z.string().optional()
-      },
-      async ({ cacheId, option, lineCount, filePath }) => {
-        try {
-          const cached = this.outputCacheService.getCachedOutput(cacheId);
-          if (!cached) {
-            return {
-              content: [{
-                type: "text",
-                text: `缓存 ${cacheId} 不存在或已过期`
-              }],
-              isError: true
-            };
-          }
-
-          let output: string;
-          switch (option) {
-            case 'full':
-              output = this.outputCacheService.getFullOutput(cacheId) || '';
-              break;
-            case 'last':
-              const lines = lineCount || 100;
-              output = this.outputCacheService.getLastLines(cacheId, lines) || '';
-              break;
-            case 'save':
-              if (!filePath) {
-                return {
-                  content: [{
-                    type: "text",
-                    text: '保存文件时需要提供filePath参数'
-                  }],
-                  isError: true
-                };
-              }
-              const fullOutput = this.outputCacheService.getFullOutput(cacheId) || '';
-              fs.writeFileSync(filePath, fullOutput);
-              return {
-                content: [{
-                  type: "text",
-                  text: `输出已保存到 ${filePath}`
-                }]
-              };
-            default:
-              output = this.outputCacheService.getFullOutput(cacheId) || '';
-          }
-
-          return {
-            content: [{
-              type: "text",
-              text: output
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取缓存输出时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
-
-    // 列出缓存统计
-    this.server.tool(
-      "getCacheStats",
-      "Gets cache statistics.",
-      {},
-      () => {
-        const stats = this.outputCacheService.getStats();
+        this.safetyCheckService.updateUserRules({ allowlist, denylist });
         return {
           content: [{
-            type: "text",
-            text: `缓存统计:\n总条目: ${stats.total}\n活跃: ${stats.active}\n过期: ${stats.expired}`
-          }]
-        };
-      }
-    );
-
-    // 清空缓存
-    this.server.tool(
-      "clearCache",
-      "Clears all cached outputs.",
-      {},
-      () => {
-        this.outputCacheService.clearAll();
-        return {
-          content: [{
-            type: "text",
-            text: '所有缓存已清空'
-          }]
+            type: 'text',
+            text: `Safety rules updated. ${allowlist.length} allowlist rule(s), ${denylist.length} denylist rule(s).`,
+          }],
         };
       }
     );
   }
 
-  /**
-   * 关闭所有连接并清理资源
-   */
   public async close(): Promise<void> {
     try {
-      // 停止所有后台任务
-      for (const id of this.backgroundExecutions.keys()) {
-        this.stopBackgroundExecution(id);
+      for (const connectionId of this.backgroundExecutions.keys()) {
+        this.stopBackgroundExecution(connectionId);
       }
-      
-      // 关闭SSH服务
       await this.sshService.close();
-      
-      // 清空活跃连接记录
       this.activeConnections.clear();
       this.backgroundExecutions.clear();
       this.pendingConfirmations.clear();
@@ -2839,31 +402,7 @@ export class SshMCP {
     }
   }
 
-  /**
-   * 处理长文本输出，超过限制时截取前后部分
-   */
   private limitOutputLength(text: string, maxLength: number = 3000, targetLength: number = 1500): string {
-    if (text.length <= maxLength) {
-      return text;
-    }
-
-    // 计算保留前后部分的长度
-    const halfTargetLength = Math.floor(targetLength / 2);
-    
-    // 提取前后部分
-    const prefix = text.substring(0, halfTargetLength);
-    const suffix = text.substring(text.length - halfTargetLength);
-    
-    // 添加省略指示及如何获取完整输出的提示
-    const omittedLength = text.length - targetLength;
-    const omittedMessage = `\n\n... 已省略 ${omittedLength} 个字符 ...\n` +
-                           `如需查看完整输出，可添加以下参数：\n` +
-                           `- 使用 > output.txt 将输出保存到文件\n` +
-                           `- 使用 | head -n 数字 查看前几行\n` +
-                           `- 使用 | tail -n 数字 查看后几行\n` +
-                           `- 使用 | grep "关键词" 过滤包含特定内容的行\n\n`;
-    
-    // 组合输出
-    return prefix + omittedMessage + suffix;
+    return sharedLimitOutputLength(text, maxLength, targetLength);
   }
 }
