@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as path from 'path';
+
 import OpenAI from 'openai';
 import type { ChatCompletionCreateParamsNonStreaming } from 'openai/resources/chat/completions';
 
@@ -15,6 +18,19 @@ interface CachedSafetyResult {
   timestamp: number;
 }
 
+export interface UserSafetyRule {
+  pattern: string;
+  level: 'safe' | 'moderate' | 'dangerous';
+  reason: string;
+}
+
+export interface UserSafetyRules {
+  allowlist: UserSafetyRule[];
+  denylist: UserSafetyRule[];
+}
+
+const EMPTY_RULES: UserSafetyRules = { allowlist: [], denylist: [] };
+
 export class SafetyCheckService {
   private openai: OpenAI | null = null;
   private readonly localOnly: boolean;
@@ -23,13 +39,16 @@ export class SafetyCheckService {
   private readonly MAX_CACHE_SIZE = 100;
   private readonly thinkingMode: ThinkingMode;
   private readonly model: string;
+  private readonly rulesPath: string | null;
+  private userRules: UserSafetyRules;
 
   constructor(
     apiKey?: string,
     apiBase?: string,
     model: string = 'gpt-3.5-turbo',
     timeout: number = 30000,
-    thinkingMode: ThinkingMode = 'disabled'
+    thinkingMode: ThinkingMode = 'disabled',
+    dataPath?: string
   ) {
     this.model = model;
     this.localOnly = !apiKey;
@@ -43,19 +62,117 @@ export class SafetyCheckService {
       });
     }
     this.thinkingMode = thinkingMode;
+    this.rulesPath = dataPath ? path.join(dataPath, 'safety-rules.json') : null;
+    this.userRules = this.loadUserRules();
+  }
+
+  private loadUserRules(): UserSafetyRules {
+    if (!this.rulesPath) {
+      return { allowlist: [], denylist: [] };
+    }
+
+    try {
+      if (fs.existsSync(this.rulesPath)) {
+        const raw = fs.readFileSync(this.rulesPath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        return {
+          allowlist: Array.isArray(parsed.allowlist) ? parsed.allowlist : [],
+          denylist: Array.isArray(parsed.denylist) ? parsed.denylist : [],
+        };
+      }
+    } catch {
+      // Corrupted file - start fresh
+    }
+    return { allowlist: [], denylist: [] };
+  }
+
+  private saveUserRules(): void {
+    if (!this.rulesPath) {
+      return;
+    }
+
+    try {
+      const dir = path.dirname(this.rulesPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(this.rulesPath, JSON.stringify(this.userRules, null, 2), 'utf-8');
+    } catch (error) {
+      console.error('Failed to save safety rules:', error);
+    }
+  }
+
+  getUserRules(): UserSafetyRules {
+    return this.userRules;
+  }
+
+  updateUserRules(rules: UserSafetyRules): void {
+    this.userRules = {
+      allowlist: Array.isArray(rules.allowlist) ? rules.allowlist : [],
+      denylist: Array.isArray(rules.denylist) ? rules.denylist : [],
+    };
+    this.cache.clear();
+    this.saveUserRules();
   }
 
   /**
-   * 检查指令安全性
+   * Check command against user-defined rules. Returns the match result or null.
    */
+  private checkUserRules(command: string): SafetyCheckResult | null {
+    const cmd = command.trim().toLowerCase();
+
+    // Denylist takes priority
+    for (const rule of this.userRules.denylist) {
+      try {
+        if (new RegExp(rule.pattern, 'i').test(cmd)) {
+          return {
+            level: rule.level,
+            reason: rule.reason,
+            ...(rule.level === 'dangerous' ? { consequences: rule.reason } : {}),
+            ...(rule.level === 'moderate' ? { suggestedAction: 'Please confirm this operation' } : {}),
+          };
+        }
+      } catch {
+        // Invalid regex - skip
+      }
+    }
+
+    // Allowlist overrides local rules
+    for (const rule of this.userRules.allowlist) {
+      try {
+        if (new RegExp(rule.pattern, 'i').test(cmd)) {
+          return {
+            level: rule.level,
+            reason: rule.reason,
+          };
+        }
+      } catch {
+        // Invalid regex - skip
+      }
+    }
+
+    return null;
+  }
+
   async checkCommandSafety(command: string): Promise<SafetyCheckResult> {
-    // 1. 检查缓存
     const cached = this.getCachedResult(command);
     if (cached) {
       return cached;
     }
 
-    // 2. 无 API Key 时直接使用本地规则
+    // User denylist overrides everything
+    const userResult = this.checkUserRules(command);
+    if (userResult && userResult.level === 'dangerous') {
+      this.cacheResult(command, userResult);
+      return userResult;
+    }
+
+    // User allowlist overrides local rules
+    if (userResult && userResult.level === 'safe') {
+      this.cacheResult(command, userResult);
+      return userResult;
+    }
+
     if (this.localOnly) {
       const quickResult = this.quickCheck(command);
       this.cacheResult(command, quickResult);
@@ -63,13 +180,11 @@ export class SafetyCheckService {
     }
 
     try {
-      // 3. 优先使用AI进行安全检查
       const result = await this.analyzeCommandWithAI(command);
       this.cacheResult(command, result);
       return result;
     } catch (error) {
       console.error('AI安全检查失败 (网络或解析错误):', error);
-      // 4. 降级方案：使用本地规则引擎
       console.warn('正在使用快速安全检查作为降级方案');
       const quickResult = this.quickCheck(command);
       this.cacheResult(command, quickResult);
