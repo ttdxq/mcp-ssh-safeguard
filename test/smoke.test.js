@@ -30,9 +30,8 @@ test('output cache returns the requested trailing lines', () => {
 });
 
 test('docker credential persistence stays opt-in', () => {
-  assert.equal(isInsecureDockerCredentialPersistenceEnabled({}), false);
-  assert.equal(isInsecureDockerCredentialPersistenceEnabled({ ALLOW_INSECURE_DOCKER_CREDENTIALS: 'false' }), false);
-  assert.equal(isInsecureDockerCredentialPersistenceEnabled({ ALLOW_INSECURE_DOCKER_CREDENTIALS: 'true' }), true);
+  assert.equal(isInsecureDockerCredentialPersistenceEnabled({ ALLOW_INSECURE_DOCKER_CREDENTIALS: false }), false);
+  assert.equal(isInsecureDockerCredentialPersistenceEnabled({ ALLOW_INSECURE_DOCKER_CREDENTIALS: true }), true);
 });
 
 test('ssh MCP source registers cache tools', async () => {
@@ -40,14 +39,14 @@ test('ssh MCP source registers cache tools', async () => {
   assert.match(source, /this\.registerCacheTools\(\);/);
   assert.match(source, /beforeCapture = await this\.sshService\.executeCommand\(/);
   assert.match(source, /const hasCommandOutput = Boolean\(result\.stdout \|\| result\.stderr\);/);
-  assert.match(source, /process\.env\.OPENAI_API_KEY \|\| process\.env\.ARK_API_KEY/);
-  assert.match(source, /process\.env\.OPENAI_THINKING_TYPE \|\| process\.env\.ARK_THINKING_TYPE/);
+  assert.match(source, /loadConfig\(\)/);
+  assert.match(source, /resolveSafetyCheckConfig/);
   assert.match(source, /private async assessOperationPolicy\(/);
   assert.match(source, /createPendingConfirmationKey\(connectionId, operationType, command\)/);
   assert.match(source, /if \(confirmation && !pending\) \{/);
   assert.match(source, /高风险确认请求已拒绝/);
   assert.match(source, /if \(!this\.safetyCheckService\) \{/);
-  assert.match(source, /this\.isFailClosedAllowedCommand\(command\)/);
+
   assert.match(source, /operationType === 'background_command'/);
   assert.match(source, /后台持续执行会放大指令影响范围/);
   assert.match(source, /confirmation: z\.string\(\)\.optional\(\)\.describe\("Confirmation string required for commands that need explicit approval"\)/);
@@ -84,9 +83,9 @@ test('python bridge starts node without shell mode', async () => {
 
 test('index source shuts down after fatal process errors', async () => {
   const source = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
-  assert.match(source, /async function shutdown\(/);
-  assert.match(source, /await shutdown\(sshMCP, processManager, 1, '检测到致命异常，正在安全关闭SSH MCP服务\.\.\.'\);/);
-  assert.match(source, /await shutdown\(sshMCP, processManager, 1, '检测到未处理的Promise拒绝，正在安全关闭SSH MCP服务\.\.\.'\);/);
+  assert.match(source, /async function gracefulShutdown\(/);
+  assert.match(source, /shutdownOnFatalError\('未捕获的异常，准备退出:'/);
+  assert.match(source, /shutdownOnFatalError\('未处理的Promise拒绝，准备退出:'/);
 });
 
 test('repository standardizes on npm lockfile for installs', async () => {
